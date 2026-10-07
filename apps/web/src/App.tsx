@@ -157,8 +157,13 @@ function Dashboard() {
 }
 function RoomPage() {
   const { code = '' } = useParams(); const nav = useNavigate(); const { user } = useAuth(); const [room, setRoom] = useState<Room | null>(null); const [messages, setMessages] = useState<Message[]>([]); const [connected, setConnected] = useState(false); const [error, setError] = useState(''); const [tab, setTab] = useState<'chat' | 'people'>('chat'); const [password, setPassword] = useState(''); const [needsPassword, setNeedsPassword] = useState(false); const [transfer, setTransfer] = useState<Participant | null>(null); const [movieOpen, setMovieOpen] = useState(false); const [movieError, setMovieError] = useState(''); const [reaction, setReaction] = useState<{ emoji: string; name: string } | null>(null); const socketRef = useRef<Socket | null>(null);
-  const isAdmin = room?.ownerId === user?.id;
+  const [playback, setPlayback] = useState<Playback>({ position: 0, playing: false, updatedAt: Date.now() }); const [online, setOnline] = useState<Record<string, boolean>>({});
   const [library, setLibrary] = useState<MediaItem[]>([]);
+  const [settingsOpen, setSettingsOpen] = useState(false); const [settingsError, setSettingsError] = useState(''); const [settingsBusy, setSettingsBusy] = useState(false); const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
+  type UploadState = { uploading: boolean; percent: number; fileName: string; loaded: number; total: number; };
+  const [uploadState, setUploadState] = useState<UploadState | null>(null);
+  const uploadAbortRef = useRef<AbortController | null>(null);
+  const isAdmin = room?.ownerId === user?.id;
   useEffect(() => { if (movieOpen) request<{ media: MediaItem[] }>('/media').then((result) => setLibrary(result.media)).catch(() => setLibrary([])); }, [movieOpen]);
   useEffect(() => { let mounted = true; post<{ room: Room }>(`/rooms/${code}/join`, {}).then(({ room: joined }) => { if (mounted) { setRoom(joined); setNeedsPassword(false); } }).catch((err) => { if (mounted) { const text = err instanceof Error ? err.message : ''; if (text.toLowerCase().includes('password')) setNeedsPassword(true); else setError(text); } }); return () => { mounted = false; socketRef.current?.disconnect(); }; }, [code]);
   useEffect(() => { const openPicker = () => { setMovieError(''); setMovieOpen(true); }; document.addEventListener('open-movie-picker', openPicker); return () => document.removeEventListener('open-movie-picker', openPicker); }, []);
@@ -176,16 +181,11 @@ function RoomPage() {
     socket.on('room:closed', () => { setError('This movie room has closed.'); window.setTimeout(() => nav('/app'), 1500); }); socket.on('room:left', () => nav('/app')); socket.on('room:removed', () => nav('/app')); socket.on('room:error', (data: { message: string }) => setError(data.message));
     return () => { socket.disconnect(); socketRef.current = null; };
   }, [room?._id, code]);
-  const [playback, setPlayback] = useState<Playback>({ position: 0, playing: false, updatedAt: Date.now() }); const [online, setOnline] = useState<Record<string, boolean>>({});
   const joinWithPassword = async (e: FormEvent) => { e.preventDefault(); try { const data = await post<{ room: Room }>(`/rooms/${code}/join`, { password }); setRoom(data.room); setNeedsPassword(false); setError(''); } catch (err) { setError(err instanceof Error ? err.message : 'Could not join.'); } };
   if (needsPassword) return <div className="password-screen"><Brand/><form className="password-card" onSubmit={joinWithPassword}><div className="lock-large"><LockKeyhole/></div><span className="eyebrow">PRIVATE MOVIE NIGHT</span><h1>One more thing.</h1><p>This room is password protected. Ask your friend for the secret knock.</p><input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Room password" autoFocus required/>{error && <div className="error-banner">{error}</div>}<button className="button button-primary button-wide">Join the room <ArrowRight size={16}/></button><Link className="back-link" to="/app"><ArrowLeft size={15}/> Back to dashboard</Link></form></div>;
   if (error && !room) return <div className="password-screen"><Brand/><div className="password-card"><div className="lock-large"><Film/></div><h1>Can’t get in.</h1><p>{error}</p><Link to="/app" className="button button-primary button-wide">Back to dashboard</Link></div></div>;
   if (!room) return <div className="screen-loading"><LoaderCircle className="spin"/> Preparing your room…</div>;
   const active = room.participants.filter((p) => p.isActive); const emit = (event: string, payload?: unknown) => socketRef.current?.emit(event, payload);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsError, setSettingsError] = useState('');
-  const [settingsBusy, setSettingsBusy] = useState(false);
-  const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
   const leave = async () => { try { await post(`/rooms/${code}/leave`); } finally { socketRef.current?.disconnect(); nav('/app'); } };
   const closeRoom = async () => { try { await request(`/rooms/${code}`, { method: 'DELETE' }); nav('/app'); } catch (err) { setError(err instanceof Error ? err.message : 'Could not close room.'); setCloseConfirmOpen(false); } };
   const saveSettings = async (e: FormEvent<HTMLFormElement>) => {
@@ -215,16 +215,6 @@ function RoomPage() {
       setSettingsBusy(false);
     }
   };
-  type UploadState = {
-    uploading: boolean;
-    percent: number;
-    fileName: string;
-    loaded: number;
-    total: number;
-  };
-  const [uploadState, setUploadState] = useState<UploadState | null>(null);
-  const uploadAbortRef = useRef<AbortController | null>(null);
-
   const cancelUpload = () => {
     uploadAbortRef.current?.abort();
     uploadAbortRef.current = null;
