@@ -21,6 +21,41 @@ type JoinedRoomHistory = HistoryDetails & { roomId: string; roomCode: string; ro
 type CreatedRoomHistory = HistoryDetails & { _id: string; roomCode: string; name: string; description?: string; status: string; createdAt: string };
 const uid = (p: Participant) => typeof p.userId === 'string' ? p.userId : p.userId?._id || '';
 const initials = (name: string) => name.split(/\s+/).slice(0, 2).map((part) => part[0]).join('').toUpperCase();
+function useModalFocusTrap(isOpen: boolean) {
+  useEffect(() => {
+    if (!isOpen) return;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const dialogs = document.querySelectorAll<HTMLElement>('[role="dialog"][aria-modal="true"]');
+    const dialog = dialogs[dialogs.length - 1];
+    if (!dialog) return;
+    const focusableSelector = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    const getFocusable = () => Array.from(dialog.querySelectorAll<HTMLElement>(focusableSelector)).filter((element) => element.getAttribute('aria-hidden') !== 'true');
+    (getFocusable()[0] || dialog).focus();
+    const trapTab = (event: KeyboardEvent) => {
+      if (event.key !== 'Tab') return;
+      const focusable = getFocusable();
+      if (!focusable.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    dialog.addEventListener('keydown', trapTab);
+    return () => {
+      dialog.removeEventListener('keydown', trapTab);
+      if (previousFocus?.isConnected) previousFocus.focus();
+    };
+  }, [isOpen]);
+}
 const youtubeIdFromUrl = (value: string) => {
   try {
     const url = new URL(value);
@@ -35,6 +70,15 @@ const youtubeIdFromUrl = (value: string) => {
     const id = parts[0] === 'watch' ? url.searchParams.get('v') : ['embed', 'shorts', 'live'].includes(parts[0] || '') ? parts[1] : null;
     return id && /^[\w-]{11}$/.test(id) ? id : null;
   } catch { return null; }
+};
+const usesApiCredentials = (value: string) => {
+  try {
+    const mediaOrigin = new URL(value, window.location.origin).origin;
+    const apiOrigin = new URL(API || window.location.origin, window.location.origin).origin;
+    return mediaOrigin === apiOrigin;
+  } catch {
+    return false;
+  }
 };
 type YouTubePlayerInstance = { playVideo: () => void; pauseVideo: () => void; seekTo: (seconds: number, allowSeekAhead: boolean) => void; getCurrentTime: () => number; getDuration: () => number; getPlayerState: () => number; setVolume: (volume: number) => void; mute: () => void; unMute: () => void; setPlaybackRate: (rate: number) => void; destroy: () => void };
 type YouTubeApi = { Player: new (element: HTMLElement, options: { videoId: string; playerVars?: Record<string, string | number>; events: { onReady: (event: { target: YouTubePlayerInstance }) => void; onStateChange: (event: { data: number; target: YouTubePlayerInstance }) => void; onError: () => void } }) => YouTubePlayerInstance; PlayerState: { ENDED: number; PLAYING: number } };
@@ -160,6 +204,7 @@ function AuthPage({ signup = false, reset = false }: { signup?: boolean; reset?:
 }
 function Dashboard() {
   const { user, setUser } = useAuth(); const nav = useNavigate(); const [rooms, setRooms] = useState<Room[]>([]); const [createOpen, setCreateOpen] = useState(false); const [roomCode, setRoomCode] = useState(''); const [error, setError] = useState(''); const [busy, setBusy] = useState(false); const [menu, setMenu] = useState(false);
+  useModalFocusTrap(createOpen);
   const refresh = () => request<{ rooms: Room[] }>('/rooms').then((d) => setRooms(d.rooms)).catch(() => {});
   useEffect(() => { refresh(); }, []);
   useEffect(() => {
@@ -257,6 +302,7 @@ function RoomPage() {
   type UploadState = { uploading: boolean; percent: number; fileName: string; loaded: number; total: number; };
   const [uploadState, setUploadState] = useState<UploadState | null>(null);
   const uploadAbortRef = useRef<AbortController | null>(null);
+  useModalFocusTrap(Boolean(transfer || movieOpen || settingsOpen || closeConfirmOpen));
   const isAdmin = room?.ownerId === user?.id;
   useEffect(() => { if (movieOpen) request<{ media: MediaItem[] }>('/media').then((result) => setLibrary(result.media)).catch(() => setLibrary([])); }, [movieOpen]);
   useEffect(() => { let mounted = true; post<{ room: Room }>(`/rooms/${code}/join`, {}).then(({ room: joined }) => { if (mounted) { setRoom(joined); setNeedsPassword(false); } }).catch((err) => { if (mounted) { const text = err instanceof Error ? err.message : ''; if (text.toLowerCase().includes('password')) setNeedsPassword(true); else setError(text); } }); return () => { mounted = false; socketRef.current?.disconnect(); }; }, [code]);
@@ -268,7 +314,7 @@ function RoomPage() {
     socket.on('room:state', (data: { room: Room; playback?: Playback }) => { setRoom(data.room); if (data.playback) setPlayback(data.playback); });
     socket.on('participants:update', (participants: Participant[]) => setRoom((prev) => prev ? { ...prev, participants } : prev));
     socket.on('chat:history', (history: Message[]) => setMessages(history)); socket.on('chat:message', (message: Message) => setMessages((prev) => [...prev.slice(-99), message]));
-    socket.on('playback:sync', (state: Playback) => setPlayback(state)); socket.on('playback:movie-change', (data: { media: Room['currentMedia'] }) => { if (data.media) setRoom((prev) => prev ? { ...prev, currentMedia: data.media } : prev); setPlayback({ position: 0, playing: false, updatedAt: Date.now() }); });
+    socket.on('playback:sync', (state: Playback) => setPlayback(state)); socket.on('playback:speed', (state: Playback) => setPlayback(state)); socket.on('playback:movie-change', (data: { media: Room['currentMedia'] }) => { if (data.media) setRoom((prev) => prev ? { ...prev, currentMedia: data.media } : prev); setPlayback({ position: 0, playing: false, speed: 1, updatedAt: Date.now() }); });
     socket.on('playback:ended', () => setPlayback({ position: 0, playing: false, updatedAt: Date.now() }));
     socket.on('presence:update', ({ userId, online }: { userId: string; online: boolean }) => setOnline((prev) => ({ ...prev, [userId]: online })));
     socket.on('reaction:received', ({ id, emoji, name }: { id: string; emoji: string; name: string }) => {
@@ -284,7 +330,7 @@ function RoomPage() {
       if (closeConfirmOpen) { setCloseConfirmOpen(false); return; }
       if (transfer) { setTransfer(null); return; }
       if (settingsOpen) { setSettingsOpen(false); return; }
-      if (movieOpen) { if (uploadState) cancelUpload(); setMovieOpen(false); return; }
+      if (movieOpen) { closeMovieModal(); return; }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
@@ -307,12 +353,13 @@ function RoomPage() {
     const maxParticipants = Number(f.get('maxParticipants'));
     const password = String(f.get('password') || '').trim();
     try {
+      const removePassword = f.get('removePassword') === 'on';
       const payload: { name: string; description?: string; visibility: 'private' | 'public'; maxParticipants: number; password?: string } = {
         name,
         description: description || undefined,
         visibility,
         maxParticipants,
-        ...(password ? { password } : {})
+        ...(removePassword ? { password: '' } : password ? { password } : {})
       };
       const data = await updateRoomSettings(code, payload);
       setRoom(data.room);
@@ -328,6 +375,11 @@ function RoomPage() {
     uploadAbortRef.current = null;
     setUploadState(null);
     setMovieError('Upload cancelled.');
+  };
+  const closeMovieModal = () => {
+    if (uploadState?.uploading && !window.confirm('Cancel this upload and close the movie picker?')) return;
+    if (uploadState?.uploading) cancelUpload();
+    setMovieOpen(false);
   };
 
   const transferAdmin = async () => { if (!transfer) return; try { const data = await post<{ room: Room }>(`/rooms/${code}/transfer-admin`, { userId: uid(transfer) }); setRoom(data.room); setTransfer(null); } catch (err) { setError(err instanceof Error ? err.message : 'Could not transfer admin.'); } };
@@ -388,7 +440,7 @@ function RoomPage() {
       <aside className={`room-sidebar ${tab === 'people' ? 'show-people' : ''}`}><div className="sidebar-tabs"><button className={tab === 'chat' ? 'selected' : ''} onClick={() => setTab('chat')}><MessageCircle size={15}/> Chat <span>{messages.filter((m) => m.messageType !== 'system').length}</span></button><button className={tab === 'people' ? 'selected' : ''} onClick={() => setTab('people')}><Users size={15}/> People <span>{active.length}</span></button></div>{tab === 'chat' ? <ChatPanel messages={messages} emit={emit} user={user}/>: <PeoplePanel participants={active} currentUser={user} isAdmin={!!isAdmin} online={online} onTransfer={setTransfer} onRemove={remove}/>}<div className="sidebar-footer">{isAdmin ? <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%', gap: '8px' }}><button type="button" onClick={() => { setSettingsError(''); setSettingsOpen(true); }} style={{ color: '#c4b5fd' }}><Settings2 size={14}/> Room settings</button><button type="button" onClick={() => setCloseConfirmOpen(true)} style={{ color: '#fda4af' }}><LogOut size={14}/> Close room</button></div> : <button onClick={leave}><LogOut size={14}/> Leave movie night</button>}</div></aside></main>
     {error && room && <div className="toast-error" onClick={() => setError('')}>{error}<X size={14}/></div>}
     {transfer && <div className="modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) setTransfer(null); }}><div className="confirm-card" role="dialog" aria-modal="true" aria-labelledby="transfer-admin-heading"><div className="confirm-icon"><Crown size={21}/></div><button className="icon-button modal-close" aria-label="Close dialog" onClick={() => setTransfer(null)}><X size={17}/></button><span className="eyebrow">PASS THE POPCORN</span><h2 id="transfer-admin-heading">Transfer admin?</h2><p>{user?.name} will hand room controls to <b>{transfer.name || 'this participant'}</b>. You’ll stay in the room as a guest.</p><div className="confirm-actions"><button className="button button-soft" onClick={() => setTransfer(null)}>Keep control</button><button className="button button-primary" onClick={transferAdmin}>Transfer rights <ArrowRight size={15}/></button></div></div></div>}
-    {movieOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) { if (uploadState) cancelUpload(); setMovieOpen(false); } }}><div className="modal-card media-modal" role="dialog" aria-modal="true" aria-labelledby="choose-movie-heading"><div className="modal-heading"><div><span className="eyebrow">SET THE SCENE</span><h2 id="choose-movie-heading">Choose a movie</h2></div><button className="icon-button" aria-label="Close dialog" onClick={() => { if (uploadState) cancelUpload(); setMovieOpen(false); }}><X size={18}/></button></div>
+    {movieOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) closeMovieModal(); }}><div className="modal-card media-modal" role="dialog" aria-modal="true" aria-labelledby="choose-movie-heading"><div className="modal-heading"><div><span className="eyebrow">SET THE SCENE</span><h2 id="choose-movie-heading">Choose a movie</h2></div><button className="icon-button" aria-label="Close dialog" onClick={closeMovieModal}><X size={18}/></button></div>
       {library.length > 0 && <div className="library-list"><span className="eyebrow">YOUR VIDEO LIBRARY</span>{library.map((item) => <button className="library-item" type="button" key={item._id} disabled={!!uploadState} onClick={() => void selectLibraryMovie(item._id)}><Film size={17}/><span className="library-item-content"><b>{item.title}</b>{item.description && <small className="library-description">{item.description}</small>}<span className="library-item-details"><small>{item.sourceType === 'upload' ? 'Uploaded video' : youtubeIdFromUrl(item.sourceUrl) ? 'YouTube video' : 'Video link'}{item.mimeType ? ` · ${item.mimeType}` : ''}</small>{typeof item.duration === 'number' && item.duration > 0 && <small>{Math.floor(item.duration / 60)}:{String(Math.floor(item.duration % 60)).padStart(2, '0')}</small>}{item.createdAt && <small>Added {new Date(item.createdAt).toLocaleDateString()}</small>}</span></span><span className="library-select-label">Select <ArrowRight size={14}/></span></button>)}</div>}
       <div className="media-choice">
         <div className="media-choice-icon"><Film/></div>
@@ -412,7 +464,7 @@ function RoomPage() {
             </div>
             <button type="button" className="button button-soft button-sm upload-cancel-btn" onClick={cancelUpload}>Cancel</button>
           </div>
-          <div className="upload-progress-track" role="progressbar" aria-valuenow={uploadState.percent} aria-valuemin={0} aria-valuemax={100} aria-label="Upload progress">
+          <div className="upload-progress-track" role="progressbar" aria-valuenow={uploadState.percent} aria-valuemin={0} aria-valuemax={100} aria-valuetext={`${uploadState.percent}%`} aria-label="Upload progress">
             <div className="upload-progress-fill" style={{ width: `${Math.max(4, uploadState.percent)}%` }} />
           </div>
           <div className="upload-progress-meta">
@@ -438,7 +490,8 @@ function RoomPage() {
           <label>Visibility<select name="visibility" defaultValue={room.visibility || 'private'}><option value="private">Private — invite only</option><option value="public">Public</option></select></label>
           <label>Max guests<select name="maxParticipants" defaultValue={String(room.maxParticipants || 8)}><option value="4">4 people</option><option value="8">8 people</option><option value="12">12 people</option><option value="20">20 people</option></select></label>
         </div>
-        <label>Room password <span className="optional">LEAVE BLANK TO KEEP UNCHANGED</span><input name="password" type="password" minLength={4} placeholder="Update or remove password"/></label>
+        <label>Room password <span className="optional">LEAVE BLANK TO KEEP UNCHANGED</span><input name="password" type="password" minLength={4} placeholder="Enter a new password"/></label>
+        <label className="checkbox-label"><input name="removePassword" type="checkbox"/> Remove the current password</label>
         {settingsError && <div className="error-banner">{settingsError}</div>}
         <div className="confirm-actions" style={{ marginTop: '16px' }}>
           <button type="button" className="button button-soft" onClick={() => setSettingsOpen(false)}>Cancel</button>
@@ -462,13 +515,14 @@ function RoomPage() {
     </div>}
   </div>;
 }
-type Playback = { position: number; playing: boolean; updatedAt: number; changedBy?: string };
+type Playback = { position: number; playing: boolean; speed?: number; updatedAt: number; changedBy?: string };
 function VideoPlayer({ media, playback, isAdmin, reactions, emit }: { media?: Room['currentMedia']; playback: Playback; isAdmin: boolean; reactions: { id: string; emoji: string; name: string }[]; emit: (event: string, payload?: unknown) => void }) {
   const frameRef = useRef<HTMLDivElement>(null); const videoRef = useRef<HTMLVideoElement>(null); const youtubeContainerRef = useRef<HTMLDivElement>(null); const youtubeRef = useRef<YouTubePlayerInstance | null>(null); const emitRef = useRef(emit); const adminRef = useRef(isAdmin);
-  const [time, setTime] = useState(0); const [duration, setDuration] = useState(0); const [volume, setVolume] = useState(0.8); const [muted, setMuted] = useState(false); const [speed, setSpeed] = useState(1); const [mediaError, setMediaError] = useState(false); const [youtubeReady, setYoutubeReady] = useState(false);
+  const [time, setTime] = useState(0); const [duration, setDuration] = useState(0); const [volume, setVolume] = useState(0.8); const [muted, setMuted] = useState(false); const [speed, setSpeed] = useState(playback.speed || 1); const [mediaError, setMediaError] = useState(false); const [youtubeReady, setYoutubeReady] = useState(false); const [playbackBlocked, setPlaybackBlocked] = useState(false);
   const [scrubTime, setScrubTime] = useState<number | null>(null);
-  const youtubeId = media?.url ? youtubeIdFromUrl(media.url) : null; const expectedPosition = playback.position + (playback.playing ? Math.max(0, (Date.now() - playback.updatedAt) / 1000) : 0);
+  const youtubeId = media?.url ? youtubeIdFromUrl(media.url) : null; const expectedPosition = playback.position + (playback.playing ? Math.max(0, (Date.now() - playback.updatedAt) / 1000) * (playback.speed || 1) : 0);
   useEffect(() => { emitRef.current = emit; adminRef.current = isAdmin; }, [emit, isAdmin]);
+  useEffect(() => { setSpeed(playback.speed || 1); }, [playback.speed]);
   useEffect(() => {
     setTime(0); setDuration(0); setMediaError(false); setYoutubeReady(false); setScrubTime(null);
     if (!media?.url || youtubeId) return;
@@ -486,7 +540,7 @@ function VideoPlayer({ media, playback, isAdmin, reactions, emit }: { media?: Ro
         playerVars: { autoplay: 0, controls: 0, disablekb: 1, playsinline: 1, rel: 0, origin: location.origin },
         events: {
           onReady: ({ target: player }) => { if (cancelled) return; youtubeRef.current = player; player.setVolume(Math.round(volume * 100)); if (muted) player.mute(); setDuration(player.getDuration() || 0); setYoutubeReady(true); },
-          onStateChange: ({ data, target: player }) => { if (cancelled) return; if (window.YT?.PlayerState && data === window.YT.PlayerState.ENDED && adminRef.current) emitRef.current('playback:ended'); if (data === window.YT?.PlayerState.PLAYING) setTime(player.getCurrentTime()); },
+          onStateChange: ({ data, target: player }) => { if (cancelled) return; if (window.YT?.PlayerState && data === window.YT.PlayerState.ENDED && adminRef.current) emitRef.current('playback:ended'); if (data === window.YT?.PlayerState.PLAYING) { setPlaybackBlocked(false); setTime(player.getCurrentTime()); } },
           onError: () => setMediaError(true)
         }
       });
@@ -505,19 +559,28 @@ function VideoPlayer({ media, playback, isAdmin, reactions, emit }: { media?: Ro
       const player = youtubeRef.current;
       if (!youtubeReady || !player) return;
       if (Math.abs((player.getCurrentTime() || 0) - expected) > 1.25) player.seekTo(expected, true);
-      if (playback.playing) player.playVideo(); else player.pauseVideo();
+      player.setPlaybackRate(playback.speed || 1);
+      if (playback.playing) {
+        player.playVideo();
+        const blockedTimeout = window.setTimeout(() => { if (player.getPlayerState() !== 1) setPlaybackBlocked(true); }, 1200);
+        return () => window.clearTimeout(blockedTimeout);
+      }
+      player.pauseVideo();
+      setPlaybackBlocked(false);
       return;
     }
     const video = videoRef.current;
     if (!video || !media?.url) return;
+    video.playbackRate = playback.speed || 1;
     if (Math.abs(video.currentTime - expected) > 1.25) video.currentTime = expected;
-    if (playback.playing && video.paused) void video.play().catch(() => {}); else if (!playback.playing && !video.paused) video.pause();
-  }, [playback.position, playback.playing, playback.updatedAt, media?.url, youtubeId, youtubeReady]);
+    if (playback.playing && video.paused) void video.play().then(() => setPlaybackBlocked(false)).catch(() => setPlaybackBlocked(true));
+    else if (!playback.playing) { if (!video.paused) video.pause(); setPlaybackBlocked(false); }
+  }, [playback.position, playback.playing, playback.speed, playback.updatedAt, media?.url, youtubeId, youtubeReady]);
   useEffect(() => {
     if (!playback.playing || !media?.url) return;
     const interval = window.setInterval(() => {
       if (scrubTime !== null) return;
-      const currentExpected = Math.max(0, playback.position + (playback.playing ? Math.max(0, (Date.now() - playback.updatedAt) / 1000) : 0));
+      const currentExpected = Math.max(0, playback.position + (playback.playing ? Math.max(0, (Date.now() - playback.updatedAt) / 1000) * (playback.speed || 1) : 0));
       if (youtubeId) {
         const player = youtubeRef.current;
         if (!youtubeReady || !player) return;
@@ -542,7 +605,12 @@ function VideoPlayer({ media, playback, isAdmin, reactions, emit }: { media?: Ro
   };
   const changeVolume = (value: number) => { setVolume(value); setMuted(value === 0); if (youtubeId) { youtubeRef.current?.setVolume(Math.round(value * 100)); if (value > 0) youtubeRef.current?.unMute(); else youtubeRef.current?.mute(); } else if (videoRef.current) { videoRef.current.volume = value; videoRef.current.muted = value === 0; } };
   const toggleMute = () => { const next = !muted; setMuted(next); if (youtubeId) { if (next) youtubeRef.current?.mute(); else { youtubeRef.current?.unMute(); youtubeRef.current?.setVolume(Math.round(volume * 100)); } } else if (videoRef.current) videoRef.current.muted = next; };
-  const changeSpeed = (value: number) => { setSpeed(value); if (youtubeId) youtubeRef.current?.setPlaybackRate(value); else if (videoRef.current) videoRef.current.playbackRate = value; };
+  const changeSpeed = (value: number) => { if (!isAdmin) return; setSpeed(value); if (youtubeId) youtubeRef.current?.setPlaybackRate(value); else if (videoRef.current) videoRef.current.playbackRate = value; emit('playback:speed', { speed: value }); };
+  const unblockPlayback = () => {
+    if (youtubeId) { youtubeRef.current?.playVideo(); setPlaybackBlocked(false); return; }
+    const video = videoRef.current;
+    if (video) void video.play().then(() => setPlaybackBlocked(false)).catch(() => setPlaybackBlocked(true));
+  };
   const playFromOverlay = () => {
     if (!isAdmin) return;
     emit('playback:play', { position: time });
@@ -550,13 +618,14 @@ function VideoPlayer({ media, playback, isAdmin, reactions, emit }: { media?: Ro
   const toggleFullscreen = () => { if (document.fullscreenElement) void document.exitFullscreen(); else void frameRef.current?.requestFullscreen(); };
   return <div className="video-frame" ref={frameRef}><div className={`video-screen ${mediaError ? 'video-failed' : ''} ${youtubeId ? 'video-youtube' : ''}`}>
     {media?.url ? <>
-      {youtubeId ? <div className="youtube-player-mount" ref={youtubeContainerRef}/> : <video ref={videoRef} src={media.url} playsInline preload="metadata" onTimeUpdate={(event) => { if (scrubTime === null) setTime(event.currentTarget.currentTime); }} onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)} onError={() => setMediaError(true)} onEnded={() => emit('playback:ended')}/>}
+      {youtubeId ? <div className="youtube-player-mount" ref={youtubeContainerRef}/> : <video ref={videoRef} src={media.url} crossOrigin={usesApiCredentials(media.url) ? 'use-credentials' : undefined} playsInline preload="metadata" onTimeUpdate={(event) => { if (scrubTime === null) setTime(event.currentTarget.currentTime); }} onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)} onError={() => setMediaError(true)} onEnded={() => emit('playback:ended')}/>}
       {!mediaError && !playback.playing && time < 0.5 && <div className="video-overlay"><span className="overlay-caption">{isAdmin ? 'THE THEATER IS ALL YOURS' : 'PLAYBACK CONTROLLED BY ROOM ADMIN'}</span><h2>Settle in.<br/><i>The good part’s coming.</i></h2><button className="overlay-play" disabled={!isAdmin} onClick={playFromOverlay} aria-label={isAdmin ? 'Start synchronized playback' : 'Waiting for the room admin to start playback'} title={isAdmin ? 'Start playback for everyone' : 'Only the room admin can start playback'}><Play fill="currentColor" size={19}/></button><span className="overlay-caption">{isAdmin ? 'START FOR EVERYONE' : 'WAITING FOR ROOM ADMIN'}</span></div>}
       {playback.playing && <div className="video-live"><i className="live-dot"/> WATCHING TOGETHER</div>}
+      {playback.playing && playbackBlocked && <button className="playback-unblock" type="button" onClick={unblockPlayback}>Tap to play on this device <Play size={15} fill="currentColor"/></button>}
       {mediaError && <div className="video-error-overlay"><b>Video could not be loaded</b><span>{youtubeId ? 'This video may not allow embedding, may be private, or may be unavailable in your region.' : 'Check that this direct video file is reachable and shared with the room.'}</span></div>}
     </> : <div className="video-empty"><div className="empty-film"><Clapperboard size={26}/></div><span className="eyebrow">YOUR MOVIE NIGHT, YOUR MOVIE</span><h2>Every great night<br/>starts with a story.</h2><p>{isAdmin ? 'Choose a shared video to get the popcorn rolling.' : 'Your host will choose a movie in just a moment.'}</p>{isAdmin && <button className="button button-primary" onClick={() => document.dispatchEvent(new CustomEvent('open-movie-picker'))}>Choose a movie <ArrowRight size={15}/></button>}<span className="video-legal">Use a direct video file or an embeddable YouTube video. Streaming-service pages aren’t supported.</span></div>}</div>
     {reactions.length > 0 && <div className="reaction-burst-layer" aria-live="polite" aria-label="Room reactions">{reactions.map((reaction) => { const lane = [...reaction.id].reduce((value, character) => value + character.charCodeAt(0), 0) % 5; return <div className={`reaction-burst reaction-burst-${lane}`} key={reaction.id}><span className="reaction-burst-emoji" role="img" aria-label={`${reaction.name} reacted ${reaction.emoji}`}>{reaction.emoji}</span><span className="reaction-burst-name">{reaction.name}</span></div>; })}</div>}
-    {media?.url && <div className="player-controls"><button className="control-play" disabled={!isAdmin} onClick={() => emit(playback.playing ? 'playback:pause' : 'playback:play', { position: scrubTime !== null ? scrubTime : time })} aria-label={playback.playing ? 'Pause' : 'Play'}>{playback.playing ? 'Ⅱ' : <Play size={17} fill="currentColor"/>}</button><span className="control-time">{fmt(scrubTime !== null ? scrubTime : time)}</span><input className="seek-bar" type="range" min={0} max={duration || 100} step={0.1} value={Math.min(scrubTime !== null ? scrubTime : time, duration || 100)} disabled={!isAdmin} onPointerDown={(event) => setScrubTime(Number(event.currentTarget.value))} onChange={(event) => { const val = Number(event.target.value); setScrubTime(val); seek(val); }} onPointerUp={(event) => commitSeek(Number(event.currentTarget.value))} onMouseUp={(event) => commitSeek(Number(event.currentTarget.value))} onTouchEnd={(event) => commitSeek(Number(event.currentTarget.value))} onKeyDown={(event) => { if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) setScrubTime(Number(event.currentTarget.value)); }} onKeyUp={(event) => { if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) commitSeek(Number(event.currentTarget.value)); }} onBlur={(event) => { if (scrubTime !== null) commitSeek(Number(event.currentTarget.value)); }}/><span className="control-time">{fmt(duration)}</span><button className="control-icon" onClick={toggleMute} aria-label={muted ? 'Unmute' : 'Mute'}>{muted ? <VolumeX size={17}/> : <Volume2 size={17}/>}</button><input className="volume-range" aria-label="Volume" type="range" min={0} max={1} step={0.05} value={muted ? 0 : volume} onChange={(event) => changeVolume(Number(event.target.value))}/><select className="speed-select" aria-label="Playback speed" value={speed} onChange={(event) => changeSpeed(Number(event.target.value))}>{[0.5, 0.75, 1, 1.25, 1.5, 2].map((rate) => <option key={rate} value={rate}>{rate}x</option>)}</select><button className="control-icon" onClick={toggleFullscreen} aria-label="Toggle fullscreen"><Maximize size={16}/></button></div>}
+    {media?.url && <div className="player-controls"><button className="control-play" disabled={!isAdmin} onClick={() => emit(playback.playing ? 'playback:pause' : 'playback:play', { position: scrubTime !== null ? scrubTime : time })} aria-label={playback.playing ? 'Pause' : 'Play'}>{playback.playing ? 'Ⅱ' : <Play size={17} fill="currentColor"/>}</button><span className="control-time">{fmt(scrubTime !== null ? scrubTime : time)}</span><input className="seek-bar" aria-label="Seek slider" type="range" min={0} max={duration || 100} step={0.1} value={Math.min(scrubTime !== null ? scrubTime : time, duration || 100)} disabled={!isAdmin} onPointerDown={(event) => { event.currentTarget.setPointerCapture(event.pointerId); setScrubTime(Number(event.currentTarget.value)); }} onChange={(event) => { const val = Number(event.target.value); setScrubTime(val); if (!youtubeId) seek(val); }} onPointerUp={(event) => commitSeek(Number(event.currentTarget.value))} onPointerCancel={(event) => commitSeek(Number(event.currentTarget.value))} onLostPointerCapture={(event) => { if (scrubTime !== null) commitSeek(Number(event.currentTarget.value)); }} onKeyDown={(event) => { if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) setScrubTime(Number(event.currentTarget.value)); }} onKeyUp={(event) => { if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) commitSeek(Number(event.currentTarget.value)); }} onBlur={(event) => { if (scrubTime !== null) commitSeek(Number(event.currentTarget.value)); }}/><span className="control-time">{fmt(duration)}</span><button className="control-icon" onClick={toggleMute} aria-label={muted ? 'Unmute' : 'Mute'}>{muted ? <VolumeX size={17}/> : <Volume2 size={17}/>}</button><input className="volume-range" aria-label="Volume" type="range" min={0} max={1} step={0.05} value={muted ? 0 : volume} onChange={(event) => changeVolume(Number(event.target.value))}/><select className="speed-select" aria-label="Playback speed" value={speed} disabled={!isAdmin} onChange={(event) => changeSpeed(Number(event.target.value))}>{[0.5, 0.75, 1, 1.25, 1.5, 2].map((rate) => <option key={rate} value={rate}>{rate}x</option>)}</select><button className="control-icon" onClick={toggleFullscreen} aria-label="Toggle fullscreen"><Maximize size={16}/></button></div>}
   </div>;
 }
 function ChatPanel({ messages, emit, user }: { messages: Message[]; emit: (event: string, payload?: unknown) => void; user: User | null }) {

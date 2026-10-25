@@ -63,9 +63,10 @@ Configure these Vercel environment variables before deploying:
 - `JWT_SECRET` — a unique, randomly generated secret.
 - `CLIENT_ORIGIN` — the canonical HTTPS origin used for OAuth redirects and room invite links.
 - `API_PUBLIC_URL` — the canonical HTTPS origin used to create uploaded-media URLs.
+- `TRUST_PROXY` — optional trusted proxy hop count, subnet, or address list. Vercel defaults to one trusted proxy; for other hosts, set the value to match the actual trusted proxy topology and never blindly trust arbitrary forwarded headers.
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_REDIRECT_URI` — only if enabling Google sign-in; the callback URL must be registered with Google.
 
-Vercel's function filesystem is temporary, so local video uploads stored under `/tmp` are not durable or guaranteed to be available from another function instance. The current 1 GB upload limit is also not suitable for Vercel function uploads. Use authorized direct video URLs or move uploads to durable object storage before relying on the upload feature in production. The Vercel services/bindings setup does not need a service binding: browser requests reach the API through the public same-origin rewrites, and Vercel bindings are for server-side function-to-function calls.
+Vercel's function filesystem is temporary and its request limits do not support this app's 1 GB local-upload workflow, so uploads are explicitly disabled there until durable object storage is integrated. Use authorized direct video URLs in the meantime. The API stores auth-rate-limit counters in MongoDB and checks a persisted token version for logout revocation. The Vercel services/bindings setup does not need a service binding: browser requests reach the API through the public same-origin rewrites, and Vercel bindings are for server-side function-to-function calls.
 
 For deployments on a separate Node host, deploy `apps/api` with a persistent disk or durable object storage, MongoDB, `JWT_SECRET`, `CLIENT_ORIGIN`, and `API_PUBLIC_URL`. Set the web build's `VITE_API_URL` and `VITE_SOCKET_URL` to that public API origin when frontend and API are hosted on different domains.
 

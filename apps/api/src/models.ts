@@ -4,6 +4,7 @@ const UserSchema = new Schema({
   name: { type: String, required: true, trim: true, maxlength: 60 },
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
   passwordHash: { type: String },
+  tokenVersion: { type: Number, default: 0 },
   googleId: { type: String, unique: true, sparse: true, index: true },
   avatar: { type: String, maxlength: 1000 },
   passwordResetHash: { type: String },

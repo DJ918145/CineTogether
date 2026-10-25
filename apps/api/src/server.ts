@@ -3,10 +3,9 @@ import express, { NextFunction, Request, Response } from 'express';
 import http from 'node:http';
 import path from 'node:path';
 import fs from 'node:fs';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 config({ path: path.resolve(__dirname, '../../../.env') });
-import { createHash } from 'node:crypto';
 import cors from 'cors';
 import helmet from 'helmet';
 import cookieParser from 'cookie-parser';
@@ -18,10 +17,14 @@ import { Server } from 'socket.io';
 import { rateLimit } from 'express-rate-limit';
 import { z } from 'zod';
 import { ChatMessage, Media, Room, User } from './models';
-import { closeRoomSession, directVideoUrlError, earliestActiveParticipant, expectedPlaybackPosition, youtubeVideoId } from './roomPolicy';
+import { closeRoomSession, directVideoUrlError, earliestActiveParticipant, expectedPlaybackPosition, reserveRateLimitSlot, youtubeVideoId } from './roomPolicy';
+import { MongoRateLimitStore } from './mongoRateLimitStore';
 
 const app = express();
 const server = http.createServer(app);
+const proxyTrust = process.env.TRUST_PROXY?.trim() || (process.env.VERCEL ? '1' : 'false');
+const trustProxy = proxyTrust === 'true' ? true : proxyTrust === 'false' ? false : Number.isNaN(Number(proxyTrust)) ? proxyTrust.split(',').map((value) => value.trim()) : Number(proxyTrust);
+app.set('trust proxy', trustProxy);
 const clientOrigins = (process.env.CLIENT_ORIGIN || 'http://localhost:5173')
   .split(',')
   .map((origin) => origin.trim())
@@ -35,22 +38,39 @@ app.use(express.json({ limit: '32kb' }));
 app.use(cookieParser());
 const uploadDir = path.resolve(process.env.UPLOAD_DIR || (process.env.VERCEL ? '/tmp/cinetogether-uploads' : './uploads'));
 fs.mkdirSync(uploadDir, { recursive: true });
-app.use('/uploads', express.static(uploadDir, { maxAge: '1d', dotfiles: 'deny' }));
-const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeaders: true, legacyHeaders: false });
-const loginLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 10, standardHeaders: true, legacyHeaders: false });
+const limiterStore = process.env.NODE_ENV === 'test' ? undefined : (prefix: string) => new MongoRateLimitStore(prefix);
+const jsonRateLimitError = (_req: Request, res: Response) => res.status(429).json({ message: 'Too many requests. Please wait before trying again.' });
+const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeaders: true, legacyHeaders: false, store: limiterStore?.('auth'), handler: jsonRateLimitError });
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60_000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  store: limiterStore?.('login'),
+  handler: jsonRateLimitError
+});
 
-type TokenUser = { id: string; name: string };
+type TokenUser = { id: string; name: string; version?: number };
 type AuthedRequest = Request & { user?: TokenUser };
 declare global { namespace Express { interface Request { user?: TokenUser } } }
-const signToken = (user: TokenUser) => jwt.sign(user, jwtSecret, { expiresIn: '7d' });
+const signToken = (user: TokenUser) => jwt.sign({ ...user, version: user.version ?? 0 }, jwtSecret, { expiresIn: '7d' });
 function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
   const token = req.cookies?.ct_session;
   if (!token) return res.status(401).json({ message: 'Please sign in to continue.' });
-  try { req.user = jwt.verify(token, jwtSecret) as TokenUser; next(); }
+  let user: TokenUser;
+  try { user = jwt.verify(token, jwtSecret) as TokenUser; }
   catch { res.clearCookie('ct_session'); return res.status(401).json({ message: 'Your session expired. Please sign in again.' }); }
+  void User.findById(user.id).select('_id tokenVersion').then((currentUser) => {
+    if (!currentUser || (currentUser.tokenVersion ?? 0) !== (user.version ?? 0)) {
+      res.clearCookie('ct_session');
+      return res.status(401).json({ message: 'Your session is no longer valid. Please sign in again.' });
+    }
+    req.user = user;
+    next();
+  }).catch(next);
 }
-const asyncRoute = (fn: (req: AuthedRequest, res: Response) => Promise<unknown>) =>
-  (req: Request, res: Response, next: NextFunction) => Promise.resolve(fn(req as AuthedRequest, res)).catch(next);
+const asyncRoute = (fn: (req: AuthedRequest, res: Response, next: NextFunction) => Promise<unknown>) =>
+  (req: Request, res: Response, next: NextFunction) => Promise.resolve(fn(req as AuthedRequest, res, next)).catch(next);
 const cookieOptions = { httpOnly: true, sameSite: (process.env.NODE_ENV === 'production' ? 'none' : 'lax') as 'none' | 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 7 * 24 * 60 * 60 * 1000 };
 const oauthStateCookieOptions = { httpOnly: true, sameSite: 'lax' as const, secure: process.env.NODE_ENV === 'production', maxAge: 10 * 60 * 1000 };
 const googleCallbackUrl = process.env.GOOGLE_REDIRECT_URI || process.env.GOOGLE_CALLBACK_URL || `http://localhost:${process.env.PORT || 4000}/api/auth/google/callback`;
@@ -62,6 +82,30 @@ const makeCode = () => {
 };
 const publicRoom = (room: any) => ({ _id: room._id, roomCode: room.roomCode, name: room.name, description: room.description, visibility: room.visibility, maxParticipants: room.maxParticipants, status: room.status, ownerId: room.ownerId, currentMedia: room.currentMedia, participants: room.participants, createdAt: room.createdAt });
 const isValidObjectId = (id: unknown): id is string => typeof id === 'string' && mongoose.isValidObjectId(id);
+
+app.get('/uploads/:filename', requireAuth, asyncRoute(async (req, res, next) => {
+  const requestedFilename = req.params.filename;
+  if (typeof requestedFilename !== 'string') return res.status(404).json({ message: 'Video not found.' });
+  const filename = path.basename(requestedFilename);
+  if (filename !== requestedFilename) return res.status(404).json({ message: 'Video not found.' });
+  const media = await Media.findOne({ storageKey: filename }).select('_id ownerId storageKey');
+  if (!media) return res.status(404).json({ message: 'Video not found.' });
+  let authorized = String(media.ownerId) === req.user!.id;
+  if (!authorized) {
+    const mediaId = String(media._id);
+    authorized = Boolean(await Room.exists({
+      status: { $ne: 'closed' },
+      participants: { $elemMatch: { userId: req.user!.id, isActive: true } },
+      $or: [{ 'currentMedia.mediaId': mediaId }, { 'mediaHistory.mediaId': mediaId }]
+    }));
+  }
+  if (!authorized) return res.status(403).json({ message: 'Join an active room using this video to access it.' });
+  res.sendFile(filename, { root: uploadDir }, (error) => {
+    if (!error) return;
+    if (res.headersSent) console.error('Video stream failed after response started:', error);
+    else next(error);
+  });
+}));
 
 let databaseConnection: Promise<typeof mongoose> | undefined;
 const connectToDatabase = () => {
@@ -79,13 +123,13 @@ app.post('/api/auth/register', authLimiter, asyncRoute(async (req, res) => {
   const email = data.email.toLowerCase();
   if (await User.exists({ email })) return res.status(409).json({ message: 'An account with this email already exists.' });
   const user = await User.create({ name: data.name, email, passwordHash: await bcrypt.hash(data.password, 12) });
-  res.cookie('ct_session', signToken({ id: String(user._id), name: user.name }), cookieOptions).status(201).json({ user: { ...publicUser(user), authProviders: { password: true, google: false } } });
+  res.cookie('ct_session', signToken({ id: String(user._id), name: user.name, version: user.tokenVersion ?? 0 }), cookieOptions).status(201).json({ user: { ...publicUser(user), authProviders: { password: true, google: false } } });
 }));
 app.post('/api/auth/login', loginLimiter, asyncRoute(async (req, res) => {
   const data = z.object({ email: z.string().email(), password: z.string().min(1).max(100) }).parse(req.body);
   const user = await User.findOne({ email: data.email.toLowerCase() });
   if (!user?.passwordHash || !await bcrypt.compare(data.password, user.passwordHash)) return res.status(401).json({ message: 'Email or password is incorrect. If you registered with Google, continue with Google.' });
-  res.cookie('ct_session', signToken({ id: String(user._id), name: user.name }), cookieOptions).json({ user: { ...publicUser(user), authProviders: { password: true, google: Boolean(user.googleId) } } });
+  res.cookie('ct_session', signToken({ id: String(user._id), name: user.name, version: user.tokenVersion ?? 0 }), cookieOptions).json({ user: { ...publicUser(user), authProviders: { password: true, google: Boolean(user.googleId) } } });
 }));
 function createGoogleAuthorizationUrl() {
   const { GOOGLE_CLIENT_ID: clientId, GOOGLE_CLIENT_SECRET: clientSecret } = process.env;
@@ -151,9 +195,23 @@ app.get('/api/auth/google/callback', asyncRoute(async (req, res) => {
   } else {
     user = await User.create({ name: (profile.name || email.split('@')[0]).slice(0, 60), email, googleId: profile.id, avatar: profile.picture?.slice(0, 1000) });
   }
-  res.cookie('ct_session', signToken({ id: String(user._id), name: user.name }), cookieOptions).redirect(`${clientOrigin}/app`);
+  res.cookie('ct_session', signToken({ id: String(user._id), name: user.name, version: user.tokenVersion ?? 0 }), cookieOptions).redirect(`${clientOrigin}/app`);
 }));
-app.post('/api/auth/logout', (_req, res) => { res.clearCookie('ct_session', { httpOnly: true, sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax', secure: process.env.NODE_ENV === 'production' }); res.json({ message: 'Signed out.' }); });
+app.post('/api/auth/logout', asyncRoute(async (req, res) => {
+  const token = req.cookies?.ct_session;
+  let user: TokenUser | undefined;
+  if (token) {
+    try { user = jwt.verify(token, jwtSecret) as TokenUser; }
+    catch { user = undefined; }
+  }
+  if (user) {
+    const version = user.version ?? 0;
+    const result = await User.updateOne({ _id: user.id, $or: [{ tokenVersion: version }, ...(version === 0 ? [{ tokenVersion: { $exists: false } }] : [])] }, { $inc: { tokenVersion: 1 } });
+    if (result.matchedCount) io.in(`user:${user.id}`).disconnectSockets(true);
+  }
+  res.clearCookie('ct_session', { httpOnly: true, sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax', secure: process.env.NODE_ENV === 'production' });
+  res.json({ message: 'Signed out.' });
+}));
 app.post('/api/auth/forgot-password', authLimiter, asyncRoute(async (req, res) => {
   const { email } = z.object({ email: z.string().email().max(200) }).parse(req.body);
   const user = await User.findOne({ email: email.toLowerCase() });
@@ -186,7 +244,7 @@ app.patch('/api/auth/profile', requireAuth, asyncRoute(async (req, res) => {
   if (data.avatar && new URL(data.avatar).protocol !== 'https:') return res.status(400).json({ message: 'Profile photo URLs must use HTTPS.' });
   const user = await User.findByIdAndUpdate(req.user!.id, { $set: { name: data.name, ...(data.avatar !== undefined ? { avatar: data.avatar } : {}) } }, { new: true, runValidators: true }).select('_id name email avatar googleId passwordHash');
   if (!user) return res.status(404).json({ message: 'Account not found.' });
-  res.cookie('ct_session', signToken({ id: String(user._id), name: user.name }), cookieOptions).json({ user: { ...publicUser(user), authProviders: { password: Boolean(user.passwordHash), google: Boolean(user.googleId) } } });
+  res.cookie('ct_session', signToken({ id: String(user._id), name: user.name, version: user.tokenVersion ?? 0 }), cookieOptions).json({ user: { ...publicUser(user), authProviders: { password: Boolean(user.passwordHash), google: Boolean(user.googleId) } } });
 }));
 
 app.post('/api/rooms', requireAuth, asyncRoute(async (req, res) => {
@@ -465,9 +523,12 @@ app.patch('/api/rooms/:roomCode/settings', requireAuth, asyncRoute(async (req, r
   const room = await Room.findOne({ roomCode: String(req.params.roomCode).toUpperCase() });
   if (!room) return res.status(404).json({ message: 'Room not found.' });
   if (String(room.ownerId) !== req.user!.id) return res.status(403).json({ message: 'Only the room admin can change settings.' });
-  const data = roomSchema.partial().parse(req.body);
+  const data = roomSchema.partial().extend({ password: z.union([z.string().min(4).max(80), z.literal('')]).optional() }).parse(req.body);
   room.set({ name: data.name ?? room.name, description: data.description ?? room.description, maxParticipants: data.maxParticipants ?? room.maxParticipants, visibility: data.visibility ?? room.visibility });
-  await room.save(); res.json({ room: publicRoom(room) });
+  if (data.password !== undefined) room.passwordHash = data.password ? await bcrypt.hash(data.password, 10) : undefined;
+  await room.save();
+  io.to(String(room._id)).emit('room:state', { room: publicRoom(room) });
+  res.json({ room: publicRoom(room) });
 }));
 app.delete('/api/rooms/:roomCode', requireAuth, asyncRoute(async (req, res) => {
   const room = await Room.findOne({ roomCode: String(req.params.roomCode).toUpperCase() });
@@ -491,7 +552,10 @@ app.get('/api/rooms/:roomCode/messages', requireAuth, asyncRoute(async (req, res
 
 const storage = multer.diskStorage({ destination: uploadDir, filename: (_req, file, cb) => cb(null, `${Date.now()}-${randomBytes(8).toString('hex')}${path.extname(file.originalname).toLowerCase()}`) });
 const upload = multer({ storage, limits: { fileSize: 1024 * 1024 * 1024 }, fileFilter: (_req, file, cb) => cb(null, ['video/mp4', 'video/webm', 'video/ogg', 'video/quicktime'].includes(file.mimetype)) });
-app.post('/api/media/upload', requireAuth, upload.single('video'), (req, res) => {
+const requireDurableUploadStorage = (_req: Request, res: Response, next: NextFunction) => process.env.VERCEL
+  ? res.status(503).json({ message: 'Video uploads are not available on this deployment. Add durable object storage to enable uploads.' })
+  : next();
+app.post('/api/media/upload', requireAuth, requireDurableUploadStorage, upload.single('video'), (req, res) => {
   if (!req.file) return res.status(400).json({ message: 'Choose an MP4, WebM, OGG, or MOV video under 1 GB.' });
   const mediaUrl = `${process.env.API_PUBLIC_URL || `http://localhost:${process.env.PORT || 4000}`}/uploads/${req.file.filename}`;
   void Media.create({ title: req.body.title?.slice(0, 100) || path.basename(req.file.originalname, path.extname(req.file.originalname)), sourceType: 'upload', sourceUrl: mediaUrl, storageKey: req.file.filename, ownerId: req.user!.id, mimeType: req.file.mimetype })
@@ -548,7 +612,7 @@ app.post('/api/rooms/:roomCode/media', requireAuth, asyncRoute(async (req, res) 
   await room.save();
   const roomIdStr = String(room._id);
   if ((onlineByRoom.get(roomIdStr)?.size ?? 0) > 0) {
-    playback.set(roomIdStr, { position: 0, playing: false, updatedAt: Date.now() });
+    playback.set(roomIdStr, { position: 0, playing: false, speed: 1, updatedAt: Date.now() });
   } else {
     playback.delete(roomIdStr);
   }
@@ -558,7 +622,7 @@ app.post('/api/rooms/:roomCode/media', requireAuth, asyncRoute(async (req, res) 
   res.json({ room: publicRoom(room) });
 }));
 
-const playback = new Map<string, { position: number; playing: boolean; updatedAt: number }>();
+const playback = new Map<string, { position: number; playing: boolean; speed: number; updatedAt: number }>();
 const onlineByRoom = new Map<string, Map<string, { sockets: Set<string>; timer?: NodeJS.Timeout }>>();
 const PLAYBACK_TTL_MS = 60 * 60 * 1000;
 function prunePlaybackMap() {
@@ -575,7 +639,15 @@ function readSocketUser(cookie: string | undefined): TokenUser | null {
   if (!token) return null;
   try { return jwt.verify(decodeURIComponent(token), jwtSecret) as TokenUser; } catch { return null; }
 }
-io.use((socket, next) => { const user = readSocketUser(socket.handshake.headers.cookie); if (!user) return next(new Error('Authentication required')); socket.data.user = user; next(); });
+io.use((socket, next) => {
+  const user = readSocketUser(socket.handshake.headers.cookie);
+  if (!user) return next(new Error('Authentication required'));
+  void User.findById(user.id).select('_id tokenVersion').then((currentUser) => {
+    if (!currentUser || (currentUser.tokenVersion ?? 0) !== (user.version ?? 0)) return next(new Error('Authentication required'));
+    socket.data.user = user;
+    next();
+  }).catch(next);
+});
 io.on('connection', (socket) => {
   const user = socket.data.user as TokenUser;
   socket.join(`user:${user.id}`);
@@ -588,7 +660,7 @@ io.on('connection', (socket) => {
       let entry = members.get(user.id); if (!entry) { entry = { sockets: new Set() }; members.set(user.id, entry); }
       if (entry.timer) { clearTimeout(entry.timer); entry.timer = undefined; }
       entry.sockets.add(socket.id);
-      const state = playback.get(id) || { position: 0, playing: false, updatedAt: Date.now() };
+      const state = playback.get(id) || { position: 0, playing: false, speed: 1, updatedAt: Date.now() };
       socket.emit('room:state', { room: publicRoom(room), playback: state });
       const messages = await ChatMessage.find({ roomId: room._id }).sort({ createdAt: -1 }).limit(40).lean();
       socket.emit('chat:history', messages.reverse());
@@ -599,12 +671,12 @@ io.on('connection', (socket) => {
     const id = socket.data.roomId as string | undefined; if (!id) return;
     const room = await Room.findById(id); if (!room || String(room.ownerId) !== user.id) return socket.emit('room:error', { message: 'Only the room admin can control playback.' });
     const now = Date.now();
-    const prev = playback.get(id) || { position: 0, playing: false, updatedAt: now };
+    const prev = playback.get(id) || { position: 0, playing: false, speed: 1, updatedAt: now };
     const currentEstimated = expectedPlaybackPosition(prev, now);
     const targetPos = (typeof data?.position === 'number' && !Number.isNaN(data.position)) ? data.position : currentEstimated;
     const position = Math.max(0, Math.min(Number(targetPos) || 0, 24 * 60 * 60));
     const playing = event === 'playback:play' ? true : event === 'playback:pause' ? false : prev.playing;
-    const state = { position, playing, updatedAt: now };
+    const state = { position, playing, speed: prev.speed, updatedAt: now };
     playback.set(id, state);
     prunePlaybackMap();
     io.to(id).emit('playback:sync', { ...state, changedBy: user.id });
@@ -612,31 +684,42 @@ io.on('connection', (socket) => {
   socket.on('playback:play', (data) => void playEvent('playback:play', data));
   socket.on('playback:pause', (data) => void playEvent('playback:pause', data));
   socket.on('playback:seek', (data) => void playEvent('playback:seek', data));
-  socket.on('playback:ended', async () => { const id = socket.data.roomId as string | undefined; if (!id) return; const room = await Room.findById(id); if (room && String(room.ownerId) === user.id) { playback.set(id, { position: 0, playing: false, updatedAt: Date.now() }); io.to(id).emit('playback:ended'); } });
+  socket.on('playback:speed', async ({ speed }: { speed: number }) => {
+    const id = socket.data.roomId as string | undefined;
+    if (!id || ![0.5, 0.75, 1, 1.25, 1.5, 2].includes(speed)) return;
+    const room = await Room.findById(id);
+    if (!room || String(room.ownerId) !== user.id) return socket.emit('room:error', { message: 'Only the room admin can change playback speed.' });
+    const state = playback.get(id) || { position: 0, playing: false, speed: 1, updatedAt: Date.now() };
+    const now = Date.now();
+    state.position = expectedPlaybackPosition(state, now);
+    state.updatedAt = now;
+    state.speed = speed;
+    playback.set(id, state);
+    io.to(id).emit('playback:speed', state);
+  });
+  socket.on('playback:ended', async () => { const id = socket.data.roomId as string | undefined; if (!id) return; const room = await Room.findById(id); if (room && String(room.ownerId) === user.id) { playback.set(id, { position: 0, playing: false, speed: playback.get(id)?.speed || 1, updatedAt: Date.now() }); io.to(id).emit('playback:ended'); } });
   socket.on('chat:send', async ({ message }: { message: string }) => {
-    const now = Date.now(); const sentAt = (socket.data.chatSentAt as number[] | undefined) || [];
-    const recent = sentAt.filter((timestamp) => now - timestamp < 10_000);
-    if (recent.length >= 8) return socket.emit('room:error', { message: 'Slow down a little before sending another message.' });
+    const now = Date.now();
+    const reserved = reserveRateLimitSlot(socket.data.chatSentAt as number[] | undefined, now, 8, 10_000);
+    if (!reserved) return socket.emit('room:error', { message: 'Slow down a little before sending another message.' });
+    socket.data.chatSentAt = reserved;
     const id = socket.data.roomId as string | undefined; const text = typeof message === 'string' ? message.trim().slice(0, 500) : '';
     if (!id || !text) return;
     const room = await Room.findById(id);
     if (!room?.participants.some((p: any) => String(p.userId) === user.id && p.isActive)) return;
     const doc = await ChatMessage.create({ roomId: id, senderId: user.id, senderName: user.name, message: text, messageType: 'text' });
-    recent.push(now); socket.data.chatSentAt = recent;
     io.to(id).emit('chat:message', { _id: doc._id, senderId: user.id, senderName: user.name, message: text, messageType: 'text', createdAt: doc.createdAt });
   });
   socket.on('reaction:send', async ({ emoji }: { emoji: string }) => {
     const id = socket.data.roomId as string | undefined;
     if (!id || !['❤️', '😂', '👏', '😮', '🔥', '😭'].includes(emoji)) return;
     const now = Date.now();
-    const sentAt = (socket.data.reactionSentAt as number[] | undefined) || [];
-    const recent = sentAt.filter((timestamp) => now - timestamp < 10_000);
-    if (recent.length >= 8) return socket.emit('room:error', { message: 'Slow down a little before reacting again.' });
+    const reserved = reserveRateLimitSlot(socket.data.reactionSentAt as number[] | undefined, now, 8, 10_000);
+    if (!reserved) return socket.emit('room:error', { message: 'Slow down a little before reacting again.' });
+    socket.data.reactionSentAt = reserved;
     const room = await Room.findById(id);
     if (!room?.participants.some((participant: any) => String(participant.userId) === user.id && participant.isActive)) return;
     const message = await ChatMessage.create({ roomId: id, senderId: user.id, senderName: user.name, message: emoji, messageType: 'reaction' });
-    recent.push(now);
-    socket.data.reactionSentAt = recent;
     const chatMessage = { _id: message._id, senderId: user.id, senderName: user.name, message: emoji, messageType: 'reaction', createdAt: message.createdAt };
     io.to(id).emit('chat:message', chatMessage);
     io.to(id).emit('reaction:received', { id: String(message._id), emoji, userId: user.id, name: user.name });
@@ -654,7 +737,15 @@ io.on('connection', (socket) => {
   });
 });
 
+app.use((_req, res) => res.status(404).json({ message: 'Not found.' }));
 app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  const parserError = error as { type?: string; status?: number; statusCode?: number };
+  if (parserError?.type === 'entity.parse.failed' || (error instanceof SyntaxError && 'body' in error)) {
+    return res.status(400).json({ message: 'Request body contains invalid JSON.' });
+  }
+  if (parserError?.type === 'entity.too.large' || parserError?.status === 413 || parserError?.statusCode === 413) {
+    return res.status(413).json({ message: 'Request body is too large.' });
+  }
   if (error instanceof z.ZodError) return res.status(400).json({ message: error.issues[0]?.message || 'Please check the submitted information.' });
   if (error instanceof multer.MulterError) return res.status(400).json({ message: error.code === 'LIMIT_FILE_SIZE' ? 'Video file must be smaller than 1 GB.' : 'Video upload failed.' });
   if (error instanceof mongoose.Error.CastError || (error as any)?.name === 'CastError') {

@@ -1,7 +1,18 @@
 import { describe, expect, it } from 'vitest';
-import { closeRoomSession, directVideoUrlError, earliestActiveParticipant, expectedPlaybackPosition, youtubeVideoId } from './roomPolicy';
+import { closeRoomSession, directVideoUrlError, earliestActiveParticipant, expectedPlaybackPosition, reserveRateLimitSlot, youtubeVideoId } from './roomPolicy';
 
 describe('room lifecycle policy', () => {
+  it('reserves at most eight burst events before asynchronous work can run', () => {
+    let timestamps: number[] | undefined;
+    let accepted = 0;
+    for (let index = 0; index < 15; index += 1) {
+      const reserved = reserveRateLimitSlot(timestamps, 1_000, 8, 10_000);
+      if (reserved) { timestamps = reserved; accepted += 1; }
+    }
+    expect(accepted).toBe(8);
+    expect(reserveRateLimitSlot(timestamps, 11_001, 8, 10_000)).toEqual([11_001]);
+  });
+
   it('closes only the current visit and preserves previous room sessions', () => {
     const firstJoin = new Date('2026-01-01T10:00:00Z');
     const firstLeave = new Date('2026-01-01T10:30:00Z');
@@ -33,6 +44,7 @@ describe('room lifecycle policy', () => {
 
   it('advances a playing snapshot using server elapsed time', () => {
     expect(expectedPlaybackPosition({ position: 40, playing: true, updatedAt: 10_000 }, 12_500)).toBe(42.5);
+    expect(expectedPlaybackPosition({ position: 40, playing: true, speed: 1.5, updatedAt: 10_000 }, 12_000)).toBe(43);
   });
 
   it('does not advance paused playback or move backwards', () => {

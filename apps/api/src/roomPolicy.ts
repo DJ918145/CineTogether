@@ -1,6 +1,12 @@
 export type RoomParticipantLike = { isActive: boolean; joinedAt: Date | string; userId: unknown; role?: string };
 export type RoomSessionLike = { joinedAt: Date | string; leftAt?: Date | string | null };
 
+/** Reserve a fixed-window event slot synchronously before awaiting asynchronous work. */
+export function reserveRateLimitSlot(timestamps: number[] | undefined, now: number, limit: number, windowMs: number): number[] | null {
+  const recent = (timestamps || []).filter((timestamp) => now - timestamp < windowMs);
+  return recent.length >= limit ? null : [...recent, now];
+}
+
 /** Close the latest open visit, keeping older session timestamps intact. */
 export function closeRoomSession(sessions: RoomSessionLike[] | undefined, joinedAt: Date | string, leftAt: Date | string): RoomSessionLike[] {
   const updated = [...(sessions || [])];
@@ -23,8 +29,8 @@ export function earliestActiveParticipant<T extends RoomParticipantLike>(partici
 }
 
 /** Estimate playback position from a server-authored state snapshot. */
-export function expectedPlaybackPosition(state: { position: number; playing: boolean; updatedAt: number }, now = Date.now()): number {
-  return Math.max(0, state.position + (state.playing ? Math.max(0, now - state.updatedAt) / 1000 : 0));
+export function expectedPlaybackPosition(state: { position: number; playing: boolean; speed?: number; updatedAt: number }, now = Date.now()): number {
+  return Math.max(0, state.position + (state.playing ? Math.max(0, now - state.updatedAt) / 1000 * (state.speed || 1) : 0));
 }
 
 /** Get an 11-character video id only from official YouTube watch/embed URLs. */
