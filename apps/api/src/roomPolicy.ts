@@ -1,4 +1,19 @@
 export type RoomParticipantLike = { isActive: boolean; joinedAt: Date | string; userId: unknown; role?: string };
+export type RoomSessionLike = { joinedAt: Date | string; leftAt?: Date | string | null };
+
+/** Close the latest open visit, keeping older session timestamps intact. */
+export function closeRoomSession(sessions: RoomSessionLike[] | undefined, joinedAt: Date | string, leftAt: Date | string): RoomSessionLike[] {
+  const updated = [...(sessions || [])];
+  for (let index = updated.length - 1; index >= 0; index -= 1) {
+    if (!updated[index].leftAt) {
+      updated[index] = { ...updated[index], leftAt };
+      return updated;
+    }
+  }
+  if (updated.length) return updated;
+  updated.push({ joinedAt, leftAt });
+  return updated;
+}
 
 /** Select the earliest joined participant still active in a room. */
 export function earliestActiveParticipant<T extends RoomParticipantLike>(participants: T[]): T | null {

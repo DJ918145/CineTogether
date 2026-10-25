@@ -55,7 +55,19 @@ See `.env.example`. Secrets are never committed. The backend requires `JWT_SECRE
 
 ## Deployment
 
-Deploy `apps/web` as a Vercel Vite project. Set the root directory to `apps/web`, and define `VITE_API_URL`/`VITE_SOCKET_URL` for the public backend origin during build. Deploy `apps/api` to Render or another Node host with a persistent disk for local uploads (otherwise uploaded files are ephemeral), a MongoDB Atlas URI, `JWT_SECRET`, `CLIENT_ORIGIN`, `API_PUBLIC_URL`, `PORT`, and `NODE_ENV=production`. Set the API's CORS origin to the exact Vercel site origin and enable WebSockets on the host. For durable production media, replace local disk with a storage adapter backed by Cloudinary or object storage and issue authorized, expiring media URLs.
+The repository root `vercel.json` configures one Vercel project with two services: `api` (`apps/api`, Express) and `web` (`apps/web`, Vite). The public rewrites send `/api/*`, `/socket.io/*`, and `/uploads/*` to the API, then send all other paths to the web service. The web app uses same-origin API and WebSocket URLs on Vercel; do not set `VITE_API_URL` or `VITE_SOCKET_URL` unless intentionally using a different public API host. Socket.IO uses WebSocket transport for Vercel's WebSocket support.
+
+Configure these Vercel environment variables before deploying:
+
+- `MONGODB_URI` — MongoDB Atlas connection string.
+- `JWT_SECRET` — a unique, randomly generated secret.
+- `CLIENT_ORIGIN` — the canonical HTTPS origin used for OAuth redirects and room invite links.
+- `API_PUBLIC_URL` — the canonical HTTPS origin used to create uploaded-media URLs.
+- `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_REDIRECT_URI` — only if enabling Google sign-in; the callback URL must be registered with Google.
+
+Vercel's function filesystem is temporary, so local video uploads stored under `/tmp` are not durable or guaranteed to be available from another function instance. The current 1 GB upload limit is also not suitable for Vercel function uploads. Use authorized direct video URLs or move uploads to durable object storage before relying on the upload feature in production. The Vercel services/bindings setup does not need a service binding: browser requests reach the API through the public same-origin rewrites, and Vercel bindings are for server-side function-to-function calls.
+
+For deployments on a separate Node host, deploy `apps/api` with a persistent disk or durable object storage, MongoDB, `JWT_SECRET`, `CLIENT_ORIGIN`, and `API_PUBLIC_URL`. Set the web build's `VITE_API_URL` and `VITE_SOCKET_URL` to that public API origin when frontend and API are hosted on different domains.
 
 ## Project map
 

@@ -11,11 +11,25 @@ const UserSchema = new Schema({
   createdAt: { type: Date, default: Date.now }
 });
 
+const RoomSessionSchema = new Schema({
+  joinedAt: { type: Date, required: true },
+  leftAt: { type: Date }
+}, { _id: false });
+
+const RoomMediaHistorySchema = new Schema({
+  title: { type: String, required: true },
+  url: { type: String, required: true },
+  mediaId: { type: String },
+  mimeType: { type: String },
+  selectedAt: { type: Date, required: true }
+}, { _id: false });
+
 const ParticipantSchema = new Schema({
   userId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
   name: { type: String, required: true, trim: true },
   role: { type: String, enum: ['ADMIN', 'MEMBER'], default: 'MEMBER' },
   joinedAt: { type: Date, default: Date.now },
+  sessions: { type: [RoomSessionSchema], default: [] },
   isActive: { type: Boolean, default: true }
 }, { _id: false });
 
@@ -24,11 +38,13 @@ const RoomSchema = new Schema({
   name: { type: String, required: true, trim: true, maxlength: 80 },
   description: { type: String, maxlength: 240, default: '' },
   ownerId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  creatorId: { type: Schema.Types.ObjectId, ref: 'User', index: true },
   visibility: { type: String, enum: ['private', 'public'], default: 'private' },
   passwordHash: { type: String },
   maxParticipants: { type: Number, min: 2, max: 20, default: 8 },
   status: { type: String, enum: ['waiting', 'watching', 'closed'], default: 'waiting' },
   currentMedia: { title: String, url: String, mediaId: String, mimeType: String },
+  mediaHistory: { type: [RoomMediaHistorySchema], default: [] },
   participants: { type: [ParticipantSchema], default: [] },
   createdAt: { type: Date, default: Date.now }
 }, { timestamps: true });

@@ -1,7 +1,23 @@
 import { describe, expect, it } from 'vitest';
-import { directVideoUrlError, earliestActiveParticipant, expectedPlaybackPosition, youtubeVideoId } from './roomPolicy';
+import { closeRoomSession, directVideoUrlError, earliestActiveParticipant, expectedPlaybackPosition, youtubeVideoId } from './roomPolicy';
 
 describe('room lifecycle policy', () => {
+  it('closes only the current visit and preserves previous room sessions', () => {
+    const firstJoin = new Date('2026-01-01T10:00:00Z');
+    const firstLeave = new Date('2026-01-01T10:30:00Z');
+    const nextJoin = new Date('2026-01-02T10:00:00Z');
+    const nextLeave = new Date('2026-01-02T10:15:00Z');
+    const sessions = closeRoomSession([
+      { joinedAt: firstJoin, leftAt: firstLeave },
+      { joinedAt: nextJoin }
+    ], nextJoin, nextLeave);
+    expect(sessions).toEqual([
+      { joinedAt: firstJoin, leftAt: firstLeave },
+      { joinedAt: nextJoin, leftAt: nextLeave }
+    ]);
+    expect(closeRoomSession(sessions, nextJoin, nextLeave)).toEqual(sessions);
+  });
+
   it('chooses the earliest participant who is still active', () => {
     const participants = [
       { userId: 'host', role: 'ADMIN', isActive: false, joinedAt: '2026-01-01T00:00:00Z' },

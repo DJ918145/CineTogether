@@ -18,18 +18,22 @@ import { Server } from 'socket.io';
 import { rateLimit } from 'express-rate-limit';
 import { z } from 'zod';
 import { ChatMessage, Media, Room, User } from './models';
-import { directVideoUrlError, earliestActiveParticipant, expectedPlaybackPosition, youtubeVideoId } from './roomPolicy';
+import { closeRoomSession, directVideoUrlError, earliestActiveParticipant, expectedPlaybackPosition, youtubeVideoId } from './roomPolicy';
 
 const app = express();
 const server = http.createServer(app);
-const clientOrigin = process.env.CLIENT_ORIGIN || 'http://localhost:5173';
+const clientOrigins = (process.env.CLIENT_ORIGIN || 'http://localhost:5173')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const clientOrigin = clientOrigins[0];
 const jwtSecret = process.env.JWT_SECRET || 'local-development-secret-change-me';
-const io = new Server(server, { cors: { origin: clientOrigin, credentials: true } });
+const io = new Server(server, { cors: { origin: clientOrigins, credentials: true } });
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
-app.use(cors({ origin: clientOrigin, credentials: true }));
+app.use(cors({ origin: clientOrigins, credentials: true }));
 app.use(express.json({ limit: '32kb' }));
 app.use(cookieParser());
-const uploadDir = path.resolve(process.env.UPLOAD_DIR || './uploads');
+const uploadDir = path.resolve(process.env.UPLOAD_DIR || (process.env.VERCEL ? '/tmp/cinetogether-uploads' : './uploads'));
 fs.mkdirSync(uploadDir, { recursive: true });
 app.use('/uploads', express.static(uploadDir, { maxAge: '1d', dotfiles: 'deny' }));
 const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeaders: true, legacyHeaders: false });
@@ -58,6 +62,16 @@ const makeCode = () => {
 };
 const publicRoom = (room: any) => ({ _id: room._id, roomCode: room.roomCode, name: room.name, description: room.description, visibility: room.visibility, maxParticipants: room.maxParticipants, status: room.status, ownerId: room.ownerId, currentMedia: room.currentMedia, participants: room.participants, createdAt: room.createdAt });
 const isValidObjectId = (id: unknown): id is string => typeof id === 'string' && mongoose.isValidObjectId(id);
+
+let databaseConnection: Promise<typeof mongoose> | undefined;
+const connectToDatabase = () => {
+  if (!databaseConnection) databaseConnection = mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/cinetogether');
+  return databaseConnection;
+};
+if (process.env.VERCEL && process.env.NODE_ENV !== 'test') {
+  app.use((_req, _res, next) => { void connectToDatabase().then(() => next()).catch(next); });
+  io.use((_socket, next) => { void connectToDatabase().then(() => next()).catch(next); });
+}
 
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', database: mongoose.connection.readyState === 1 ? 'connected' : 'offline' }));
 app.post('/api/auth/register', authLimiter, asyncRoute(async (req, res) => {
@@ -163,7 +177,7 @@ app.post('/api/auth/reset-password', authLimiter, asyncRoute(async (req, res) =>
   res.json({ message: 'Password updated. You can now log in with your new password.' });
 }));
 app.get('/api/auth/me', requireAuth, asyncRoute(async (req, res) => {
-  const user = await User.findById(req.user!.id).select('_id name email avatar googleId');
+  const user = await User.findById(req.user!.id).select('_id name email avatar googleId passwordHash');
   if (!user) return res.status(401).json({ message: 'Account not found.' });
   res.json({ user: { ...publicUser(user), authProviders: { password: Boolean(user.passwordHash), google: Boolean(user.googleId) } } });
 }));
@@ -180,12 +194,100 @@ app.post('/api/rooms', requireAuth, asyncRoute(async (req, res) => {
   const passwordHash = data.password ? await bcrypt.hash(data.password, 10) : undefined;
   let roomCode = makeCode();
   while (await Room.exists({ roomCode })) roomCode = makeCode();
-  const room = await Room.create({ ...data, passwordHash, roomCode, ownerId: req.user!.id, participants: [{ userId: req.user!.id, name: req.user!.name, role: 'ADMIN' }] });
+  const createdAt = new Date();
+  const room = await Room.create({ ...data, passwordHash, roomCode, ownerId: req.user!.id, creatorId: req.user!.id, participants: [{ userId: req.user!.id, name: req.user!.name, role: 'ADMIN', joinedAt: createdAt, sessions: [{ joinedAt: createdAt }] }] });
   res.status(201).json({ room: publicRoom(room), inviteUrl: `${clientOrigin}/room/${roomCode}` });
 }));
 app.get('/api/rooms', requireAuth, asyncRoute(async (req, res) => {
   const rooms = await Room.find({ 'participants.userId': req.user!.id, status: { $ne: 'closed' } }).sort({ updatedAt: -1 }).limit(12).select('-passwordHash');
   res.json({ rooms: rooms.map(publicRoom) });
+}));
+app.get('/api/history', requireAuth, asyncRoute(async (req, res) => {
+  const userId = new mongoose.Types.ObjectId(req.user!.id);
+  const [joinedRooms, createdRooms] = await Promise.all([
+    Room.find({ 'participants.userId': userId }).select('-passwordHash').lean(),
+    Room.find({ $or: [{ creatorId: userId }, { 'participants.0.userId': userId }] }).select('-passwordHash').lean()
+  ]);
+  const createdRoomIds = new Set(createdRooms.map((room: any) => String(room._id)));
+  const historyRooms = [...new Map([...joinedRooms, ...createdRooms].map((room: any) => [String(room._id), room])).values()] as any[];
+  const roomIds = historyRooms.map((room) => room._id);
+  const roomMessages = roomIds.length ? await ChatMessage.find({ roomId: { $in: roomIds } }).sort({ createdAt: 1 }).lean() : [];
+  const messagesByRoom = new Map<string, any[]>();
+  for (const message of roomMessages) {
+    const id = String(message.roomId);
+    const messages = messagesByRoom.get(id) || [];
+    messages.push({
+      _id: String(message._id),
+      senderName: message.senderName,
+      message: message.message,
+      messageType: message.messageType,
+      createdAt: message.createdAt
+    });
+    messagesByRoom.set(id, messages);
+  }
+  const roomDetails = (room: any) => {
+    const messages = messagesByRoom.get(String(room._id)) || [];
+    const movies = room.mediaHistory?.length
+      ? room.mediaHistory
+      : messages.flatMap((message) => {
+          if (message.messageType !== 'system') return [];
+          const match = message.message.match(/ changed the movie to (.+)\.$/);
+          return match ? [{ title: match[1], selectedAt: message.createdAt }] : [];
+        });
+    return {
+      movieHistory: movies.map((movie: any) => ({
+        title: movie.title,
+        url: movie.url,
+        mimeType: movie.mimeType,
+        selectedAt: movie.selectedAt
+      })),
+      messages,
+      participants: room.participants.map((participant: any) => ({
+        name: participant.name,
+        role: participant.role,
+        isActive: participant.isActive,
+        sessions: participant.sessions?.length
+          ? participant.sessions.map((session: any) => ({ joinedAt: session.joinedAt, leftAt: session.leftAt || null }))
+          : [{ joinedAt: participant.joinedAt, leftAt: null }]
+      }))
+    };
+  };
+  const joinedHistory = joinedRooms.flatMap((room: any) => {
+    if (createdRoomIds.has(String(room._id))) return [];
+    const participant = room.participants.find((entry: any) => String(entry.userId) === req.user!.id);
+    if (!participant) return [];
+    const visits = participant.sessions?.length
+      ? participant.sessions
+      : [{ joinedAt: participant.joinedAt, leftAt: null }];
+    const orderedVisits = [...visits].sort((a: any, b: any) => new Date(a.joinedAt).getTime() - new Date(b.joinedAt).getTime());
+    return [{
+      roomId: String(room._id),
+      roomCode: room.roomCode,
+      roomName: room.name,
+      roomStatus: room.status,
+      currentMedia: room.currentMedia,
+      joinedAt: orderedVisits[0]?.joinedAt || participant.joinedAt,
+      leftAt: orderedVisits[orderedVisits.length - 1]?.leftAt || null,
+      isActive: participant.isActive,
+      visits: orderedVisits.map((session: any) => ({ joinedAt: session.joinedAt, leftAt: session.leftAt || null })),
+      ...roomDetails(room)
+    }];
+  }).sort((a: any, b: any) => new Date(b.joinedAt).getTime() - new Date(a.joinedAt).getTime());
+  res.json({
+    joinedRooms: joinedHistory,
+    createdRooms: createdRooms
+      .sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      .map((room: any) => ({
+        _id: String(room._id),
+        roomCode: room.roomCode,
+        name: room.name,
+        description: room.description,
+        status: room.status,
+        currentMedia: room.currentMedia,
+        createdAt: room.createdAt,
+        ...roomDetails(room)
+      }))
+  });
 }));
 app.get('/api/rooms/:roomCode', requireAuth, asyncRoute(async (req, res) => {
   const room = await Room.findOne({ roomCode: String(req.params.roomCode).toUpperCase(), status: { $ne: 'closed' } }).select('-passwordHash');
@@ -208,23 +310,61 @@ app.post('/api/rooms/:roomCode/join', requireAuth, asyncRoute(async (req, res) =
   if (room.visibility === 'private' && room.passwordHash && !await bcrypt.compare(String(req.body.password || ''), room.passwordHash)) return res.status(401).json({ message: 'That room password is not correct.' });
   const active = room.participants.filter((p: any) => p.isActive).length;
   if (active >= room.maxParticipants) return res.status(409).json({ message: 'This room is full.' });
-  if (existing) {
-    existing.isActive = true;
-    existing.joinedAt = new Date();
-    if (String(existing.userId) !== String(room.ownerId)) {
-      existing.role = 'MEMBER';
+  const userId = new mongoose.Types.ObjectId(req.user!.id);
+  const hasCapacity = {
+    $expr: {
+      $lt: [
+        { $size: { $filter: { input: '$participants', as: 'participant', cond: { $eq: ['$$participant.isActive', true] } } } },
+        '$maxParticipants'
+      ]
     }
+  };
+  const joinedAt = new Date();
+  const joinFilter = existing
+    ? {
+        _id: room._id,
+        status: { $ne: 'closed' },
+        participants: { $elemMatch: { userId, isActive: false } },
+        ...hasCapacity
+      }
+    : {
+        _id: room._id,
+        status: { $ne: 'closed' },
+        participants: { $not: { $elemMatch: { userId } } },
+        ...hasCapacity
+      };
+  const joinUpdate = existing
+    ? await Room.updateOne(joinFilter, {
+        $push: { 'participants.$[participant].sessions': { joinedAt } },
+        $set: {
+          'participants.$[participant].isActive': true,
+          'participants.$[participant].joinedAt': joinedAt,
+          'participants.$[participant].role': String(existing.userId) === String(room.ownerId) ? 'ADMIN' : 'MEMBER'
+        }
+      }, { arrayFilters: [{ 'participant.userId': userId, 'participant.isActive': false }] })
+    : await Room.updateOne(joinFilter, {
+        $push: { participants: { userId, name: req.user!.name, role: 'MEMBER', joinedAt, sessions: [{ joinedAt }], isActive: true } }
+      });
+  if (joinUpdate.modifiedCount === 0) {
+    const latestRoom = await Room.findById(room._id);
+    const latestParticipant = latestRoom?.participants.find((p: any) => String(p.userId) === req.user!.id);
+    if (latestRoom && latestParticipant?.isActive) return res.json({ room: publicRoom(latestRoom) });
+    if (!latestRoom || latestRoom.status === 'closed') return res.status(404).json({ message: 'We couldn’t find that room.' });
+    if (latestRoom.participants.filter((p: any) => p.isActive).length >= latestRoom.maxParticipants) return res.status(409).json({ message: 'This room is full.' });
+    return res.status(409).json({ message: 'Your room membership changed. Please try joining again.' });
   }
-  else room.participants.push({ userId: req.user!.id, name: req.user!.name, role: 'MEMBER', joinedAt: new Date(), isActive: true } as any);
-  await room.save();
-  const systemMessage = await ChatMessage.create({ roomId: room._id, senderId: req.user!.id, senderName: req.user!.name, message: `${req.user!.name} joined the movie night.`, messageType: 'system' });
-  io.to(String(room._id)).emit('participants:update', room.participants);
+  const joinedRoom = await Room.findById(room._id);
+  if (!joinedRoom) return res.status(404).json({ message: 'We couldn’t find that room.' });
+  const systemMessage = await ChatMessage.create({ roomId: joinedRoom._id, senderId: req.user!.id, senderName: req.user!.name, message: `${req.user!.name} joined the movie night.`, messageType: 'system' });
+  io.to(String(joinedRoom._id)).emit('participants:update', joinedRoom.participants);
   io.to(String(room._id)).emit('chat:message', systemMessage);
-  res.json({ room: publicRoom(room) });
+  res.json({ room: publicRoom(joinedRoom) });
 }));
 async function leaveRoom(room: any, userId: string, name: string) {
   const participant = room.participants.find((p: any) => String(p.userId) === userId && p.isActive);
   if (!participant) return;
+  const leftAt = new Date();
+  participant.sessions = closeRoomSession(participant.sessions, participant.joinedAt || leftAt, leftAt);
   const wasAdmin = participant.role === 'ADMIN';
   participant.isActive = false;
   if (wasAdmin) {
@@ -306,6 +446,8 @@ app.post('/api/rooms/:roomCode/remove-participant', requireAuth, asyncRoute(asyn
   if (typeof req.body.userId !== 'string' || !/^[a-f\d]{24}$/i.test(req.body.userId)) return res.status(400).json({ message: 'Choose a valid room participant.' });
   const p = room.participants.find((item: any) => String(item.userId) === req.body.userId && item.isActive);
   if (!p || p.role === 'ADMIN') return res.status(400).json({ message: 'That participant cannot be removed.' });
+  const removedAt = new Date();
+  p.sessions = closeRoomSession(p.sessions, p.joinedAt || removedAt, removedAt);
   p.isActive = false;
   await room.save();
   const sockets = onlineByRoom.get(String(room._id))?.get(req.body.userId);
@@ -331,7 +473,8 @@ app.delete('/api/rooms/:roomCode', requireAuth, asyncRoute(async (req, res) => {
   const room = await Room.findOne({ roomCode: String(req.params.roomCode).toUpperCase() });
   if (!room) return res.status(404).json({ message: 'Room not found.' });
   if (String(room.ownerId) !== req.user!.id) return res.status(403).json({ message: 'Only the room admin can close it.' });
-  room.status = 'closed'; room.participants.forEach((p: any) => { p.isActive = false; }); await room.save();
+  const closedAt = new Date();
+  room.status = 'closed'; room.participants.forEach((p: any) => { if (p.isActive) p.sessions = closeRoomSession(p.sessions, p.joinedAt || closedAt, closedAt); p.isActive = false; }); await room.save();
   const message = await ChatMessage.create({ roomId: room._id, senderId: req.user!.id, senderName: 'CineTogether', message: `${req.user!.name} closed the movie night.`, messageType: 'system' });
   io.to(String(room._id)).emit('chat:message', message); io.to(String(room._id)).emit('room:closed');
   playback.delete(String(room._id)); onlineByRoom.delete(String(room._id)); io.in(String(room._id)).socketsLeave(String(room._id));
@@ -398,7 +541,11 @@ app.post('/api/rooms/:roomCode/media', requireAuth, asyncRoute(async (req, res) 
   const url = rawUrl.startsWith('/') ? `${process.env.API_PUBLIC_URL || `http://localhost:${process.env.PORT || 4000}`}${rawUrl}` : rawUrl;
   const urlError = directVideoUrlError(url);
   if (urlError) return res.status(400).json({ message: urlError });
-  room.currentMedia = { title, url, mediaId: libraryItem ? String(libraryItem._id) : undefined, mimeType: youtubeVideoId(url) ? 'video/youtube' : libraryItem?.mimeType || 'video/mp4' }; room.status = 'watching'; await room.save();
+  const selectedMedia = { title, url, mediaId: libraryItem ? String(libraryItem._id) : undefined, mimeType: youtubeVideoId(url) ? 'video/youtube' : libraryItem?.mimeType || 'video/mp4' };
+  room.currentMedia = selectedMedia;
+  room.mediaHistory.push({ ...selectedMedia, selectedAt: new Date() });
+  room.status = 'watching';
+  await room.save();
   const roomIdStr = String(room._id);
   if ((onlineByRoom.get(roomIdStr)?.size ?? 0) > 0) {
     playback.set(roomIdStr, { position: 0, playing: false, updatedAt: Date.now() });
@@ -478,7 +625,22 @@ io.on('connection', (socket) => {
     recent.push(now); socket.data.chatSentAt = recent;
     io.to(id).emit('chat:message', { _id: doc._id, senderId: user.id, senderName: user.name, message: text, messageType: 'text', createdAt: doc.createdAt });
   });
-  socket.on('reaction:send', async ({ emoji }: { emoji: string }) => { const id = socket.data.roomId as string | undefined; if (!id || !['❤️', '😂', '👏', '😮', '🔥', '😭'].includes(emoji)) return; io.to(id).emit('reaction:received', { emoji, userId: user.id, name: user.name }); });
+  socket.on('reaction:send', async ({ emoji }: { emoji: string }) => {
+    const id = socket.data.roomId as string | undefined;
+    if (!id || !['❤️', '😂', '👏', '😮', '🔥', '😭'].includes(emoji)) return;
+    const now = Date.now();
+    const sentAt = (socket.data.reactionSentAt as number[] | undefined) || [];
+    const recent = sentAt.filter((timestamp) => now - timestamp < 10_000);
+    if (recent.length >= 8) return socket.emit('room:error', { message: 'Slow down a little before reacting again.' });
+    const room = await Room.findById(id);
+    if (!room?.participants.some((participant: any) => String(participant.userId) === user.id && participant.isActive)) return;
+    const message = await ChatMessage.create({ roomId: id, senderId: user.id, senderName: user.name, message: emoji, messageType: 'reaction' });
+    recent.push(now);
+    socket.data.reactionSentAt = recent;
+    const chatMessage = { _id: message._id, senderId: user.id, senderName: user.name, message: emoji, messageType: 'reaction', createdAt: message.createdAt };
+    io.to(id).emit('chat:message', chatMessage);
+    io.to(id).emit('reaction:received', { id: String(message._id), emoji, userId: user.id, name: user.name });
+  });
   socket.on('disconnect', () => {
     const id = socket.data.roomId as string | undefined; if (!id) return;
     const members = onlineByRoom.get(id); const entry = members?.get(user.id); if (!entry) return;
@@ -503,10 +665,15 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 export { app, server, io };
+export default server;
 const port = Number(process.env.PORT || 4000);
 if (process.env.NODE_ENV !== 'test') {
   if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) throw new Error('JWT_SECRET must be configured in production.');
-  mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/cinetogether')
-    .then(() => server.listen(port, () => console.log(`CineTogether API listening on http://localhost:${port}`)))
-    .catch((error) => { console.error('MongoDB connection failed:', error.message); process.exit(1); });
+  if (process.env.VERCEL) {
+    void connectToDatabase().catch((error) => { console.error('MongoDB connection failed:', error.message); });
+  } else {
+    connectToDatabase()
+      .then(() => server.listen(port, () => console.log(`CineTogether API listening on http://localhost:${port}`)))
+      .catch((error) => { console.error('MongoDB connection failed:', error.message); process.exit(1); });
+  }
 }
