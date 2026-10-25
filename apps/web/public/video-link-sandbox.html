@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#09090f" />
+    <title>Video Link Sandbox — CineTogether</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: "DM Sans", system-ui, sans-serif;
+        background: #09090f;
+        color: #f4f4f5;
+        font-synthesis: none;
+      }
+      * { box-sizing: border-box; }
+      body {
+        min-height: 100vh;
+        margin: 0;
+        background:
+          radial-gradient(ellipse at 50% 0%, rgba(124, 58, 237, .18), transparent 44rem),
+          #09090f;
+      }
+      a { color: inherit; text-decoration: none; }
+      button, input { font: inherit; }
+      .page { width: min(920px, calc(100% - 32px)); margin: 0 auto; padding: 28px 0 64px; }
+      .topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 56px; }
+      .brand { font-size: 17px; font-weight: 700; letter-spacing: -.5px; }
+      .brand span { color: #a78bfa; }
+      .back { color: #a1a1aa; font-size: 13px; }
+      .back:hover { color: #fff; }
+      .eyebrow { color: #a78bfa; font-size: 11px; font-weight: 700; letter-spacing: 1.8px; text-transform: uppercase; }
+      h1 { margin: 12px 0; font-size: clamp(32px, 6vw, 48px); letter-spacing: -2px; line-height: 1.08; }
+      .intro { max-width: 620px; margin: 0; color: #a1a1aa; font-size: 15px; line-height: 1.7; }
+      .card { margin-top: 30px; padding: clamp(18px, 4vw, 30px); border: 1px solid #252432; border-radius: 18px; background: rgba(18, 17, 27, .88); box-shadow: 0 24px 80px rgba(0, 0, 0, .24); }
+      label { display: block; margin-bottom: 10px; color: #e4e4e7; font-size: 13px; font-weight: 600; }
+      .input-row { display: flex; gap: 10px; }
+      input[type="url"] { min-width: 0; flex: 1; padding: 13px 14px; border: 1px solid #343244; border-radius: 10px; outline: none; background: #0d0c14; color: #fafafa; }
+      input[type="url"]:focus { border-color: #8b5cf6; box-shadow: 0 0 0 3px rgba(139, 92, 246, .16); }
+      .button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 12px 17px; border: 0; border-radius: 10px; background: #7c3aed; color: #fff; font-weight: 700; cursor: pointer; }
+      .button:hover { background: #8b5cf6; }
+      .examples { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+      .example { padding: 7px 10px; border: 1px solid #343244; border-radius: 999px; background: transparent; color: #c4b5fd; font-size: 12px; cursor: pointer; }
+      .example:hover { border-color: #8b5cf6; color: #fff; }
+      .message { min-height: 22px; margin: 14px 0 0; color: #a1a1aa; font-size: 13px; line-height: 1.6; }
+      .message[data-kind="error"] { color: #fca5a5; }
+      .message[data-kind="success"] { color: #86efac; }
+      .preview { display: none; overflow: hidden; margin-top: 20px; border: 1px solid #343244; border-radius: 12px; background: #000; }
+      .preview[data-visible="true"] { display: block; }
+      .preview-inner { position: relative; width: 100%; aspect-ratio: 16 / 9; }
+      .preview iframe, .preview video { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #000; }
+      .preview video { object-fit: contain; }
+      .note { margin: 18px 0 0; padding: 14px 16px; border: 1px solid #292638; border-radius: 10px; background: #11101a; color: #a1a1aa; font-size: 12px; line-height: 1.7; }
+      .note strong { color: #d4d4d8; }
+      @media (max-width: 560px) {
+        .page { width: min(100% - 24px, 920px); padding-top: 18px; }
+        .topbar { margin-bottom: 42px; }
+        .input-row { align-items: stretch; flex-direction: column; }
+        .button { min-height: 46px; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <nav class="topbar" aria-label="Main navigation">
+        <a class="brand" href="/">Cine<span>Together</span></a>
+        <a class="back" href="/">Back to CineTogether</a>
+      </nav>
+
+      <section aria-labelledby="page-title">
+        <div class="eyebrow">Isolated playback test</div>
+        <h1 id="page-title">Video link sandbox</h1>
+        <p class="intro">Try an official YouTube video link or a direct video file. This page tests link recognition and browser playback without joining a room or changing its media.</p>
+
+        <div class="card">
+          <form id="link-form">
+            <label for="video-url">Video link</label>
+            <div class="input-row">
+              <input id="video-url" name="video-url" type="url" inputmode="url" placeholder="https://…" autocomplete="url" required />
+              <button class="button" type="submit">Check and preview</button>
+            </div>
+            <div class="examples" aria-label="Example links">
+              <button class="example" type="button" data-example="https://www.youtube.com/watch?v=M7lc1UVf-VE">Try YouTube example</button>
+              <button class="example" type="button" data-example="https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4">Try direct video example</button>
+            </div>
+          </form>
+          <p class="message" id="message" role="status" aria-live="polite"></p>
+          <div class="preview" id="preview" data-visible="false" aria-label="Video preview">
+            <div class="preview-inner" id="preview-inner"></div>
+          </div>
+          <p class="note"><strong>Scope:</strong> This sandbox checks official YouTube embeds and direct MP4, WebM, or OGG files. It does not proxy links, extract protected streams, or test room permissions and multi-user synchronization. Some videos may reject embedding or require access that the browser does not have.</p>
+        </div>
+      </section>
+    </main>
+    <script>
+      (() => {
+        const form = document.querySelector("#link-form");
+        const input = document.querySelector("#video-url");
+        const message = document.querySelector("#message");
+        const preview = document.querySelector("#preview");
+        const previewInner = document.querySelector("#preview-inner");
+        const youtubeHosts = new Set([
+          "youtube.com",
+          "www.youtube.com",
+          "m.youtube.com",
+          "youtube-nocookie.com",
+          "www.youtube-nocookie.com",
+          "youtu.be",
+          "www.youtu.be",
+        ]);
+        const videoTypes = new Map([
+          [".mp4", "video/mp4"],
+          [".webm", "video/webm"],
+          [".ogg", "video/ogg"],
+        ]);
+
+        function youtubeId(url) {
+          const host = url.hostname.toLowerCase();
+          if (!youtubeHosts.has(host)) return null;
+          const parts = url.pathname.split("/").filter(Boolean);
+          const id = host.endsWith("youtu.be")
+            ? parts[0]
+            : parts[0] === "watch"
+              ? url.searchParams.get("v")
+              : ["embed", "shorts", "live"].includes(parts[0]) ? parts[1] : null;
+          return id && /^[\w-]{11}$/.test(id) ? id : null;
+        }
+
+        function setMessage(text, kind = "") {
+          message.textContent = text;
+          message.dataset.kind = kind;
+        }
+
+        function clearPreview() {
+          previewInner.replaceChildren();
+          preview.dataset.visible = "false";
+        }
+
+        function showYoutube(id) {
+          const frame = document.createElement("iframe");
+          frame.title = "YouTube video preview";
+          frame.src = `https://www.youtube-nocookie.com/embed/${encodeURIComponent(id)}?rel=0`;
+          frame.allow = "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture";
+          frame.referrerPolicy = "strict-origin-when-cross-origin";
+          frame.allowFullscreen = true;
+          previewInner.replaceChildren(frame);
+          preview.dataset.visible = "true";
+          setMessage("Official YouTube video recognized. If the preview does not play, the video may be private, unavailable, or embedding may be disabled.", "success");
+        }
+
+        function showDirectVideo(url, mimeType) {
+          const video = document.createElement("video");
+          video.controls = true;
+          video.playsInline = true;
+          video.preload = "metadata";
+          video.src = url.href;
+          video.addEventListener("error", () => {
+            setMessage("The browser could not load this file. Check that the URL is public, authorized, and serves a supported video format.", "error");
+          }, { once: true });
+          video.addEventListener("loadedmetadata", () => {
+            setMessage(`Direct video recognized (${mimeType}). Playback is controlled by the browser.`, "success");
+          }, { once: true });
+          previewInner.replaceChildren(video);
+          preview.dataset.visible = "true";
+          setMessage(`Trying direct video file (${mimeType})…`);
+        }
+
+        function checkLink(value) {
+          clearPreview();
+          let url;
+          try {
+            url = new URL(value);
+          } catch {
+            setMessage("Enter a complete video URL, including https://.", "error");
+            return;
+          }
+
+          if (url.protocol !== "https:") {
+            setMessage("For safety, use an HTTPS video link.", "error");
+            return;
+          }
+
+          const id = youtubeId(url);
+          if (id) {
+            showYoutube(id);
+            return;
+          }
+          if (youtubeHosts.has(url.hostname.toLowerCase())) {
+            setMessage("That YouTube link format or video ID is not recognized.", "error");
+            return;
+          }
+
+          const path = url.pathname.toLowerCase();
+          const extension = [...videoTypes.keys()].find((item) => path.endsWith(item));
+          if (!extension) {
+            setMessage("Use an official YouTube link or a direct .mp4, .webm, or .ogg video file. Video pages and subscription-streaming links are not supported.", "error");
+            return;
+          }
+          showDirectVideo(url, videoTypes.get(extension));
+        }
+
+        form.addEventListener("submit", (event) => {
+          event.preventDefault();
+          checkLink(input.value.trim());
+        });
+        document.querySelectorAll("[data-example]").forEach((button) => {
+          button.addEventListener("click", () => {
+            input.value = button.dataset.example;
+            checkLink(input.value);
+          });
+        });
+      })();
+    </script>
+  </body>
+</html>
