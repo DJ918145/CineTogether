@@ -1,5 +1,7 @@
 # CineTogether
 
+[**Open CineTogether Live**](https://cinetogether-three.vercel.app/app)
+
 **Watch Together. Feel Together.** CineTogether is a full-stack movie-night app for private rooms, real-time chat, shared reactions, and synchronized playback of authorized direct video sources and embeddable YouTube videos.
 
 ## Stack
