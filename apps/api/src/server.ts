@@ -73,7 +73,7 @@ const asyncRoute = (fn: (req: AuthedRequest, res: Response, next: NextFunction) 
   (req: Request, res: Response, next: NextFunction) => Promise.resolve(fn(req as AuthedRequest, res, next)).catch(next);
 const cookieOptions = { httpOnly: true, sameSite: (process.env.NODE_ENV === 'production' ? 'none' : 'lax') as 'none' | 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 7 * 24 * 60 * 60 * 1000 };
 const oauthStateCookieOptions = { httpOnly: true, sameSite: 'lax' as const, secure: process.env.NODE_ENV === 'production', maxAge: 10 * 60 * 1000 };
-const googleCallbackUrl = process.env.GOOGLE_REDIRECT_URI || process.env.GOOGLE_CALLBACK_URL || `http://localhost:${process.env.PORT || 4000}/api/auth/google/callback`;
+const googleCallbackUrl = process.env.GOOGLE_REDIRECT_URI || process.env.GOOGLE_CALLBACK_URL || `${(process.env.API_PUBLIC_URL || clientOrigin).replace(/\/+$/, '')}/api/auth/google/callback`;
 const publicUser = (user: any) => ({ id: String(user._id), name: user.name, email: user.email, avatar: user.avatar || '' });
 const roomSchema = z.object({ name: z.string().trim().min(2).max(80), description: z.string().trim().max(240).optional(), visibility: z.enum(['private', 'public']).default('private'), password: z.string().min(4).max(80).optional(), maxParticipants: z.coerce.number().int().min(2).max(20).default(8) });
 const makeCode = () => {
